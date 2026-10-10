@@ -2,7 +2,8 @@
 
 - 日期：2026-10-10
 - 状态：设计定稿，等待实现（本文档不包含任何实现改动）
-- 目标平台：macOS 15 及以上 / Apple Silicon（arm64）
+- 目标平台：Apple Silicon（arm64）；构建目标为 macOS 11.0+（`platform/macos/detect.py:81-85` 为 arm64 追加
+  `-mmacosx-version-min=11.0`；实际运行仍受 Xcode/依赖限制）
 - 上游基线：`0c92b253161d8db9c0b7a700e5cded701b26c7ba`
 - 本轮范围：只落 API Key 凭据；只做 arm64；不涉及 OAuth、代码签名/公证、旧 Web 入口
 
@@ -15,15 +16,15 @@
 ## 1. 推荐方案摘要
 
 1. **Sidecar 可执行文件位置**：macOS 使用 PyInstaller **onedir（无 `.app` 包装）**，产物目录放到
-   `VibeGodot.app/Contents/Resources/vibe_agent/godotvibe-agent/`。编辑器优先用
-   `OS::get_singleton()->get_bundle_resource_dir()` 定位 `Contents/Resources`，再回退到开发目录
+   `VibeGodot.app/Contents/Resources/vibe_agent/godotvibe-agent/`。编辑器在 `#if defined(MACOS_ENABLED)`
+   分支内用 `OS::get_singleton()->get_bundle_resource_dir()` 定位 `Contents/Resources`，再回退到开发目录
    （`.build/sidecar-dist/...`）与开发虚拟环境（`.venv/bin/python` + `vibe_tools/editor_sidecar.py`）。
-   Windows 分支原样保留。
+   Windows 分支不调用该函数，保持现有安装目录 → `.build` → `.venv` 的顺序与行为。
 2. **不要用嵌套 `.app` 作为 sidecar**：`OS_MacOS::create_process()` 在 `p_path` 是 bundle 时会走
    `NSWorkspace`（LaunchServices，异步、进程归属不同），会破坏“同步拿到子进程 PID + 握手校验”的设计。
    传纯 Mach-O 可执行文件才会走 `OS_Unix::create_process()`。这是选择 onedir 目录而非 `.app` 的硬性原因。
 3. **凭据抽象**：`vibe_tools/editor_credentials.py` 保留唯一公开函数 `credential(name, value=None)`，
-   内部按平台分派。Windows 继续用 Credential Manager（逻辑逐字不变）；macOS 用
+   内部按平台分派。Windows 继续用 Credential Manager（逻辑不变，仅抽取为 `_windows_credential`，语义等价）；macOS 用
    **Security.framework（ctypes 直接调用）** 读写登录钥匙串，不使用 `security` CLI，避免密钥出现在进程
    `argv`（Apple 帮助文本本身也警告 `-w` “insecure”）。两个平台都**没有明文回退**。
 4. **握手/端口/token/父进程监控协议不变**：`protocol_version = 1`、`127.0.0.1` 随机端口、256 位令牌、
@@ -91,7 +92,7 @@ VibeGodot.app/
 4. 父进程退出后 sidecar 看门狗自动退出。
 5. 非敏感配置（`base_url`、`model`、`vision_model`、`response_language`）仍存 Editor Settings
    `vibe_agent/*`；API Key 绝不写入项目文件、启动参数、环境变量或日志。
-6. Windows 分支、Windows 脚本、Windows 文案逐字不变。
+6. Windows 分支的行为、Windows 脚本、Windows 文案保持不变（平台分支重构不改变 Windows 路径解析顺序与结果）。
 
 ---
 
@@ -99,21 +100,30 @@ VibeGodot.app/
 
 ### 4.1 候选顺序
 
-以 `exe_dir = OS::get_singleton()->get_executable_path().get_base_dir()` 为基准，按顺序取第一个存在者：
+以 `exe_dir = OS::get_singleton()->get_executable_path().get_base_dir()` 为基准，按顺序取第一个存在者。
+Windows 与 macOS 走各自独立的 `#if` 分支，互不交叉，两个分支的三段回退均为“安装态 → 开发 onedir →
+开发 venv”。
+
+**Windows 分支（`#if defined(WINDOWS_ENABLED)`，保持现有顺序与行为）**：
+
+1. **安装态**：`exe_dir/vibe_agent/godotvibe-agent/godotvibe-agent.exe`。
+2. **开发态 onedir**：`repository/.build/sidecar-dist/godotvibe-agent/godotvibe-agent.exe`，
+   其中 `repository = exe_dir.get_base_dir()`。
+3. **开发态虚拟环境 + 脚本**：`repository/.venv/Scripts/pythonw.exe`
+   + `repository/vibe_tools/editor_sidecar.py`。
+
+**macOS 分支（`#if defined(MACOS_ENABLED)`）**：
 
 1. **macOS 安装态（`.app`）**：
    `OS::get_singleton()->get_bundle_resource_dir().path_join("vibe_agent/godotvibe-agent/godotvibe-agent")`
    - `get_bundle_resource_dir()` 在 macOS 通过 `[NSBundle mainBundle] resourcePath` 返回
      `.../Contents/Resources`（`platform/macos/os_macos.mm:454-463`）。在非 bundle 的开发态它可能返回
      包含可执行文件的目录，因此取不到就自然回退。
-   - 该 API 在 `core/os/os.h:318` 声明，非 macOS 返回空串，可安全调用而不需要 `#if`。
-2. **Windows 安装态（保持原文）**：`exe_dir/vibe_agent/godotvibe-agent/godotvibe-agent.exe`。
-3. **开发态 onedir**：`repository/.build/sidecar-dist/godotvibe-agent/godotvibe-agent`（Windows 加 `.exe`），
-   其中 `repository = exe_dir.get_base_dir()`。
-4. **开发态虚拟环境 + 脚本**：
-   - macOS：`repository/.venv/bin/python`（不存在时再试 `repository/.venv/bin/python3`）
-     + `repository/vibe_tools/editor_sidecar.py`。
-   - Windows：`repository/.venv/Scripts/pythonw.exe` + 同上的脚本路径。
+   - 该 API 在 `core/os/os.h:318` 声明，但 `core/os/os.cpp:318-320` 的非 macOS 默认实现返回 `"."` 而**不是
+     空串**，所以必须只在 `#if defined(MACOS_ENABLED)` 分支内调用；Windows 分支不得调用它。
+2. **开发态 onedir**：`repository/.build/sidecar-dist/godotvibe-agent/godotvibe-agent`。
+3. **开发态虚拟环境 + 脚本**：`repository/.venv/bin/python`（不存在时再试 `repository/.venv/bin/python3`）
+   + `repository/vibe_tools/editor_sidecar.py`。
 
 说明：开发态裸二进制位于 `<repo>/bin/godot.macos.editor.arm64`，因此
 `exe_dir.get_base_dir()` 正好是仓库根，和 Windows 的 `bin\` 约定对称。
@@ -127,7 +137,15 @@ void AgentWorkspace::_start_sidecar() {
     String executable;
     String script;
 
+#if defined(WINDOWS_ENABLED)
+    if (executable.is_empty()) {
+        // 与当前实现行为一致的三段回退：安装目录 -> .build/sidecar-dist -> .venv/Scripts
+        // 不调用 get_bundle_resource_dir()：非 macOS 默认实现返回 "."，无条件调用会污染 Windows 解析。
+        ...
+    }
+#elif defined(MACOS_ENABLED)
     // 1) macOS .app bundle: Contents/Resources/vibe_agent/godotvibe-agent/godotvibe-agent
+    // get_bundle_resource_dir() 只在 macOS 分支内调用（非 macOS 默认实现返回 "."，不是空串）。
     const String bundle_resource_dir = OS::get_singleton()->get_bundle_resource_dir();
     if (!bundle_resource_dir.is_empty()) {
         const String bundled = bundle_resource_dir.path_join("vibe_agent/godotvibe-agent/godotvibe-agent");
@@ -135,13 +153,7 @@ void AgentWorkspace::_start_sidecar() {
             executable = bundled;
         }
     }
-
-#if defined(WINDOWS_ENABLED)
-    if (executable.is_empty()) {
-        // 与当前实现逐字一致的三段回退：安装目录 -> .build -> .venv
-        ...
-    }
-#elif defined(MACOS_ENABLED)
+    // 2) 开发态 onedir -> 3) 开发态 venv
     if (executable.is_empty()) {
         const String dev_onedir = repository.path_join(".build/sidecar-dist/godotvibe-agent/godotvibe-agent");
         const String dev_python = repository.path_join(".venv/bin/python");
@@ -174,6 +186,8 @@ void AgentWorkspace::_start_sidecar() {
 - **禁止**把 sidecar 做成 `.app`：`OS_MacOS::create_process()`（`platform/macos/os_macos.mm:798-857`）
   对 bundle 会走 `NSWorkspace`，路径为纯 Mach-O 时才走 `OS_Unix::create_process()`，后者才能同步返回
   子进程 PID 供握手校验。
+- `get_bundle_resource_dir()` **只在 `#if defined(MACOS_ENABLED)` 分支内调用**；Windows 分支不引用它，
+  保持现有“安装目录 → `.build/sidecar-dist` → `.venv/Scripts/pythonw.exe`”三段回退与 `.exe` 命名不变。
 - 平台分支宏使用构建系统已有的 `WINDOWS_ENABLED` / `MACOS_ENABLED`
   （`platform/macos/detect.py:211` 追加 `MACOS_ENABLED`）。
 
@@ -308,7 +322,8 @@ com.apple.quarantine`），不在本轮解决。
 ## 7. Windows 行为保持不变
 
 - `_start_sidecar()` 的 Windows 分支保持安装目录 → `.build/sidecar-dist` → `.venv/Scripts/pythonw.exe`
-  三段回退、`.exe` 文件名、错误文案、`create_process` 调用不变。
+  三段回退、`.exe` 文件名、错误文案、`create_process` 调用不变；该分支不调用 `get_bundle_resource_dir()`
+  （其非 macOS 默认实现返回 `"."`，调用会改变 Windows 解析结果）。
 - 设置占位符在 Windows 仍为“已保存到 Windows 凭据管理器”（由 `credential_store == "windows"` 映射）。
 - `editor_credentials.py` 的 `CredWriteW`/`CredReadW` 语义（target、UTF-16LE、Persist、1168）不变。
 - `build_sidecar.ps1`、`package_windows.ps1` 不改。
@@ -373,8 +388,9 @@ com.apple.quarantine`），不在本轮解决。
 | sidecar 崩溃或端口占用 | 每实例随机端口 + 独立 token，天然隔离；重启按钮重建 |
 | `.app` 被 Gatekeeper 隔离 | 已知限制，文档提示；不做签名/公证 |
 
-**回退层级**：macOS sidecar 路径四段回退（bundle → 旧 Windows 安装目录（不命中）→ 开发 onedir →
-开发 venv）；凭据无回退（只有系统密钥库）。任何情况下都**不写明文密钥**。
+**回退层级**：macOS sidecar 路径三段回退（bundle → 开发 onedir → 开发 venv）；Windows 保持现有三段回退
+（安装目录 → 开发 onedir → 开发 venv），两平台分支互不交叉，Windows 分支不调用 `get_bundle_resource_dir()`；
+凭据无回退（只有系统密钥库）。任何情况下都**不写明文密钥**。
 
 ---
 
@@ -382,7 +398,7 @@ com.apple.quarantine`），不在本轮解决。
 
 | 文件 | 类型 | 改动 | 影响 Windows |
 | --- | --- | --- | --- |
-| `editor/plugins/agent_editor_plugin.cpp` | 改 | `_start_sidecar()` 平台化路径解析与错误文案；占位符按 `credential_store` 选择 | 否（分支内逐字保留） |
+| `editor/plugins/agent_editor_plugin.cpp` | 改 | `_start_sidecar()` 平台化路径解析与错误文案；占位符按 `credential_store` 选择 | 否（Windows 分支行为保持） |
 | `editor/plugins/agent_editor_plugin.h` | 改 | 视需要新增 1 个私有辅助方法声明（如 `_credential_store_label()`） | 否 |
 | `vibe_tools/editor_credentials.py` | 改 | 平台分派；抽出 `_windows_credential`；新增 `_macos_credential`、`credential_backend`、`CredentialError` | 否（语义等价） |
 | `vibe_tools/editor_sidecar.py` | 改 | `/v1/configure` GET/POST 返回 `credential_store`；写入失败 HTTP 500；读取失败降级字段 | 否（仅新增字段） |
@@ -509,7 +525,8 @@ test -s docs/superpowers/specs/2026-10-10-macos-agent-arm64-design.md
 | Windows Credential Manager 语义与 PowerShell 打包 | 仅 Windows | Windows |
 | 真实主模型/视觉服务链路 | 需用户自己的密钥与网络，从不在自动化测试中 | 人工，任一平台（不记录密钥） |
 
-说明：本次设计编写主机为 macOS 15.3.1 arm64，因此实现完成后 13.1 的命令可在同一类环境执行；
+说明：本次设计编写主机为 macOS 15.3.1 arm64（这是编写机版本，不是最低运行要求；arm64 构建目标为 macOS
+11.0+，见文首与 `platform/macos/detect.py:81-85`），因此实现完成后 13.1 的命令可在同一类环境执行；
 但**本提交只包含设计文档**，上述运行时验证都还没有可测的实现改动，故当前均未执行。
 
 ---
