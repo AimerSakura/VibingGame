@@ -1,4 +1,6 @@
-# VibeGodot Windows 使用说明
+# VibeGodot 使用说明
+
+## Windows 使用说明
 
 Agent 对话支持常用 Markdown：标题、粗体、斜体、删除线、行内代码、代码块、列表、引用、表格和 HTTP(S) 链接。代码保持原样，不执行 HTML 或模型提供的 BBCode。
 
@@ -37,3 +39,14 @@ Tests 分别展示行为断言、视觉判断和运行诊断。仅在进程正�
 行为或视觉失败先交主模型审查原始需求、当前源码和实际执行证据。测试合理且证据充分才自动修改游戏；硬编码、时序竞态等测试问题可以提出修订，并通过独立请求复核验收覆盖后重新运行全部启用测试。无法判断或审查服务不可用时标为受阻，不修改游戏。
 
 测试自动修订与游戏自动回修各自最多 3 轮。修订保留 ID、启用/必选状态及视觉覆盖，原始需求不变；旧计划保存在 `plan_history`，原始逐轮报告保留。Tests 显示审查理由和证据，计划中的 `review_history` 记录修订前后方案，`plan_revision` 记录测试修订轮次。游戏修复 Agent 仍无权自行删除或弱化测试。
+
+## macOS arm64 使用说明
+
+macOS 版本仅支持 arm64（Apple 芯片）。构建并打包后，运行 `.build/VibeGodot-macOS-arm64/VibeGodot.app`，在原生项目管理器中打开或新建项目。普通编辑器启动后会自动进入顶部 **Agent** 工作区；项目管理器、无头模式和恢复模式不会启动 Agent 后台。
+
+1. 点击顶部“设置”，在弹窗中填写兼容模型服务的接口地址、主模型、视觉模型和 API Key，点击“保存设置”。API Key 使用 macOS 钥匙串保存（登录钥匙串中的 `Godot/VibeAgent/api_key` 条目），不写入项目、启动参数、环境变量或日志；接口地址、模型名称和回答语言等非敏感项保存在编辑器设置中。
+2. 对话、参考图片、隔离修改、回退、Tests 与自动回修流程与 Windows 相同，操作步骤与判定规则见上方 Windows 段落。
+
+后台组件随包位于 `VibeGodot.app/Contents/Resources/vibe_agent/godotvibe-agent/godotvibe-agent`（无 `.exe` 后缀，也不是嵌套 `.app`），为 PyInstaller onedir 组件，运行机器无需安装 Python。每个编辑器实例启动独立 sidecar，监听 `127.0.0.1` 随机端口并使用独立 256 位令牌；编辑器退出时先请求正常关闭，超时后强制清理。诊断日志位于当前项目 `.godot/agent/sidecar.log`。
+
+构建命令：`bash misc/vibe_agent/build_sidecar.sh` 生成 arm64 onedir 后台，`bash misc/vibe_agent/package_macos.sh` 组装 `.build/VibeGodot-macOS-arm64/VibeGodot.app` 与 `.build/VibeGodot-macOS-arm64.zip`。当前产物未签名、未公证，仅支持 arm64；从网络下载后可能被 Gatekeeper 与 quarantine 拦截，确认来源可信后可在“系统设置 → 隐私与安全性”中允许打开，或执行 `xattr -dr com.apple.quarantine <VibeGodot.app>`。

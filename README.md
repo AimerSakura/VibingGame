@@ -2,7 +2,7 @@
 
 基于 Godot 源码定制的游戏编辑器，将 AI Agent、玩家行为测试和失败回修集成到原生工作区中。你可以直接用自然语言描述需求，由 Agent 读取项目、修改场景与脚本，再运行游戏验证修改结果。
 
-本仓库是 Godot 的定制分支，并非 Godot 官方发行版。目前提供 Windows 编辑器与后台组件的构建、打包流程。
+本仓库是 Godot 的定制分支，并非 Godot 官方发行版。目前提供 Windows 与 macOS arm64 编辑器与后台组件的构建、打包流程。
 
 ## 主要功能
 
@@ -139,6 +139,62 @@ if ($LASTEXITCODE -ne 0) { throw "Sidecar build failed" }
 - **找不到 MSVC / Windows SDK**：检查 Visual Studio 的 C++ 工作负载和 SDK，使用 Developer PowerShell 重试。
 - **PowerShell 阻止脚本运行**：检查脚本来源后，按本机或组织的执行策略允许运行；不要修改系统安全策略来绕过组织限制。
 - **后台缺失或启动失败**：确认运行的是完整发布目录，检查游戏项目中的 `.godot/agent/sidecar.log`。
+
+## macOS arm64 构建
+
+以下步骤面向 macOS arm64（Apple 芯片），所有命令在 **终端** 中执行，需先安装 Xcode Command Line Tools。仅支持 arm64，不提供 Intel 或 universal 版本；运行 Agent 同样需要自行配置模型服务。
+
+### 1. 安装构建和后台依赖
+
+```bash
+python3 -m pip install --target .build/pythonlibs \
+  scons pyinstaller fastapi uvicorn openai "pydantic>=2,<3" pillow requests pygltflib python-multipart
+export PYTHONPATH="$PWD/.build/pythonlibs:$PWD"
+```
+
+依赖安装到本项目 `.build/pythonlibs`；后台打包脚本会从这个位置查找 PyInstaller。重新打开终端后需要重新设置 `PYTHONPATH`。
+
+### 2. 编译编辑器
+
+```bash
+python3 -m SCons platform=macos target=editor arch=arm64 production=yes debug_symbols=no -j4
+```
+
+生成 `bin/godot.macos.editor.arm64`。`-j4` 表示并行编译 4 个任务；内存不足时可改为 `-j2`。
+
+### 3. 打包 Agent 后台和完整应用
+
+```bash
+bash misc/vibe_agent/build_sidecar.sh
+bash misc/vibe_agent/package_macos.sh
+```
+
+`build_sidecar.sh` 使用 PyInstaller 生成 arm64 onedir 后台（不生成嵌套 `.app`），`package_macos.sh` 将编辑器、后台、许可证和说明文档组装为 `VibeGodot.app` 并压缩。产物：
+
+```text
+.build/
+├── VibeGodot-macOS-arm64.zip
+└── VibeGodot-macOS-arm64/
+    └── VibeGodot.app/
+        └── Contents/
+            ├── MacOS/VibeGodot
+            └── Resources/
+                ├── vibe_agent/godotvibe-agent/
+                │   ├── godotvibe-agent
+                │   └── _internal/
+                ├── 使用说明.md
+                └── 能力对应表.md
+```
+
+运行：
+
+```bash
+open .build/VibeGodot-macOS-arm64/VibeGodot.app
+```
+
+API Key 保存在 macOS 登录钥匙串的 `Godot/VibeAgent/api_key` 条目中，不写入项目、启动参数、环境变量或日志；模型地址、名称、视觉模型和回答语言等非敏感项保存在编辑器设置（Editor Settings）中。分发时需要保留 `.app` 内的全部文件；目标机器无需安装 Python。
+
+> **未签名 / 未公证**：当前发布包不包含代码签名和公证，仅支持 arm64。从网络下载后 macOS Gatekeeper 可能阻止打开并标记 quarantine；确认来源可信后，可在“系统设置 → 隐私与安全性”中选择仍要打开，或执行 `xattr -dr com.apple.quarantine <VibeGodot.app>`（可选的用户操作）。
 
 ## 开发验证
 

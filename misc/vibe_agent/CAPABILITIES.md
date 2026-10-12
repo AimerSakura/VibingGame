@@ -5,7 +5,7 @@
 | 项目选择与创建 | Godot 原生项目管理器 |
 | 多轮聊天、历史、工具步骤 | 顶部 `Agent` 工作区的“对话”页，SSE 实时事件 |
 | 模型与视觉模型 | Agent 设置；非敏感值保存到 Editor Settings |
-| API Key | Windows Credential Manager |
+| API Key | Windows Credential Manager / macOS 登录钥匙串 |
 | 图片附件、拖放和剪贴板 | `.godot/agent/attachments`，历史只存元数据 |
 | 外部游戏素材 | 校验并去重导入 `res://assets`，触发文件系统扫描 |
 | 文件读取、搜索、写入、补丁、删除、重命名 | 原 Agent 工具在项目隔离副本中执行 |
@@ -20,6 +20,12 @@
 | Web / Windows 导出 | Godot 原生 Export 对话框及版本匹配的导出模板 |
 | Godot API 文档 | Godot 原生 Search Help |
 | Agent 设置 | 顶部按钮打开设置弹窗，包含模型、回答语言、清空对话和回退；对话与 Tests 使用完整宽度 |
-| 分发 | 定制编辑器与 PyInstaller onedir sidecar；目标机无需 Python |
+| 分发 | 定制编辑器与 PyInstaller onedir sidecar；Windows x86_64 发布包与 macOS arm64 `.app`；目标机无需 Python |
 
 CLI、Agent、Harness、提示词和 API 知识库继续保留。旧网页仅在阶段验收期间保留为对照，确认能力齐全后再删除。
+
+## 平台限制
+
+- 仅支持 macOS arm64（Apple 芯片），不提供 Intel 或 universal 版本。
+- macOS `.app` 当前未签名、未公证；从网络下载后可能被 Gatekeeper 与 quarantine 拦截，需要用户确认来源后手动允许打开。
+- 仅使用 PyInstaller onedir sidecar，不生成嵌套 `.app`；API Key 只保存在 macOS 登录钥匙串，不落明文。
