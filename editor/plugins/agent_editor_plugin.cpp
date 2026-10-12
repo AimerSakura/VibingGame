@@ -306,7 +306,11 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 		} break;
 		case REQUEST_CONFIGURE: {
 			api_key->clear();
-			api_key->set_placeholder(response.get("has_api_key", false) ? _u8("已保存到 Windows 凭据管理器") : _u8("输入 API Key"));
+			String credential_store = response.get("credential_store", "windows");
+			String saved_label = credential_store == "macos"
+					? _u8("已保存到 macOS 钥匙串")
+					: _u8("已保存到 Windows 凭据管理器");
+			api_key->set_placeholder(response.get("has_api_key", false) ? saved_label : _u8("输入 API Key"));
 			_request("/v1/chat/history", HTTPClient::METHOD_GET, Dictionary(), REQUEST_HISTORY);
 		} break;
 		case REQUEST_HISTORY: {
@@ -988,10 +992,14 @@ void AgentWorkspace::_set_test_busy(bool p_busy) {
 
 void AgentWorkspace::_start_sidecar() {
 	String executable_dir = OS::get_singleton()->get_executable_path().get_base_dir();
-	String executable = executable_dir.path_join("vibe_agent/godotvibe-agent/godotvibe-agent.exe");
+	String repository = executable_dir.get_base_dir();
+	String executable;
 	String script;
+	String missing_message;
+
+#if defined(WINDOWS_ENABLED)
+	executable = executable_dir.path_join("vibe_agent/godotvibe-agent/godotvibe-agent.exe");
 	if (!FileAccess::exists(executable)) {
-		String repository = executable_dir.get_base_dir();
 		String development_sidecar = repository.path_join(".build/sidecar-dist/godotvibe-agent/godotvibe-agent.exe");
 		if (FileAccess::exists(development_sidecar)) {
 			executable = development_sidecar;
@@ -1000,8 +1008,34 @@ void AgentWorkspace::_start_sidecar() {
 			script = repository.path_join("vibe_tools/editor_sidecar.py");
 		}
 	}
-	if (!FileAccess::exists(executable) || (!script.is_empty() && !FileAccess::exists(script))) {
-		_set_status(_u8("缺少 godotvibe-agent.exe；请先运行 build_sidecar.ps1，或配置仓库 .venv"), true);
+	missing_message = _u8("缺少 godotvibe-agent.exe；请先运行 build_sidecar.ps1，或配置仓库 .venv");
+#elif defined(MACOS_ENABLED)
+	// get_bundle_resource_dir() 只在 macOS 分支内调用：非 macOS 默认实现返回 "."。
+	const String bundle_resource_dir = OS::get_singleton()->get_bundle_resource_dir();
+	if (!bundle_resource_dir.is_empty()) {
+		const String bundled = bundle_resource_dir.path_join("vibe_agent/godotvibe-agent/godotvibe-agent");
+		if (FileAccess::exists(bundled)) {
+			executable = bundled;
+		}
+	}
+	if (executable.is_empty()) {
+		const String development_sidecar = repository.path_join(".build/sidecar-dist/godotvibe-agent/godotvibe-agent");
+		const String development_python = repository.path_join(".venv/bin/python");
+		const String development_python3 = repository.path_join(".venv/bin/python3");
+		if (FileAccess::exists(development_sidecar)) {
+			executable = development_sidecar;
+		} else if (FileAccess::exists(development_python) || FileAccess::exists(development_python3)) {
+			executable = FileAccess::exists(development_python) ? development_python : development_python3;
+			script = repository.path_join("vibe_tools/editor_sidecar.py");
+		}
+	}
+	missing_message = _u8("缺少 godotvibe-agent；请先运行 build_sidecar.sh，或配置仓库 .venv");
+#else
+	missing_message = _u8("当前平台不支持 Agent 后台");
+#endif
+
+	if (executable.is_empty() || (!script.is_empty() && !FileAccess::exists(script))) {
+		_set_status(missing_message, true);
 		return;
 	}
 	String project = ProjectSettings::get_singleton()->get_resource_path();
