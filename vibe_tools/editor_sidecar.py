@@ -35,7 +35,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from vibe_tools.agent import ChatHistoryStore, GameGenerator
-from vibe_tools.editor_credentials import credential
+from vibe_tools.editor_credentials import CredentialError, credential, credential_backend
 from vibe_tools.editor_language import LanguageProvider
 from vibe_tools.editor_harness import AcceptanceHarness, project_fingerprint
 from vibe_tools.editor_test_plan import change_context, generate_cases
@@ -551,9 +551,24 @@ def health() -> dict[str, Any]:
     }
 
 
+def _configure_payload(has_api_key: bool) -> dict[str, Any]:
+    payload = {**Runtime.config, "has_api_key": has_api_key, "protocol_version": PROTOCOL_VERSION}
+    try:
+        payload["credential_store"] = credential_backend()
+    except CredentialError as error:
+        payload["credential_error"] = str(error)
+    return payload
+
+
 @app.get("/v1/configure")
 def get_configuration() -> dict[str, Any]:
-    return {**Runtime.config, "has_api_key": bool(credential("api_key")), "protocol_version": PROTOCOL_VERSION}
+    try:
+        has_api_key = bool(credential("api_key"))
+    except CredentialError as error:
+        payload = _configure_payload(False)
+        payload["credential_error"] = str(error)
+        return payload
+    return _configure_payload(has_api_key)
 
 
 @app.post("/v1/configure")
@@ -561,9 +576,18 @@ def configure(request: ConfigureRequest) -> dict[str, Any]:
     if Runtime.run_lock.locked():
         raise HTTPException(409, "任务期间不能修改模型配置")
     if request.api_key:
-        credential("api_key", request.api_key)
+        try:
+            credential("api_key", request.api_key)
+        except CredentialError as error:
+            raise HTTPException(500, str(error)) from error
     Runtime.config = request.model_dump(exclude={"api_key"})
-    return {**Runtime.config, "has_api_key": bool(credential("api_key")), "protocol_version": PROTOCOL_VERSION}
+    try:
+        has_api_key = bool(credential("api_key"))
+    except CredentialError as error:
+        payload = _configure_payload(False)
+        payload["credential_error"] = str(error)
+        return payload
+    return _configure_payload(has_api_key)
 
 
 @app.get("/v1/chat/history")

@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from vibe_tools import editor_sidecar as sidecar_module
+from vibe_tools.editor_credentials import CredentialError
 from vibe_tools.editor_harness import AcceptanceHarness
 from vibe_tools.editor_sidecar import Runtime, app
 from vibe_tools.editor_workspace import Workspace
@@ -31,11 +33,14 @@ class EditorSidecarTest(unittest.TestCase):
         self.headers = {"Authorization": "Bearer sidecar-token"}
         self.credentials = patch("vibe_tools.editor_sidecar.credential", return_value="")
         self.credentials.start()
+        self.backend = patch.object(sidecar_module, "credential_backend", return_value="macos")
+        self.backend.start()
         self.preflight = patch.object(AcceptanceHarness, "_preflight", return_value={"status": "blocked", "summary": "Godot unavailable in unit test"})
         self.preflight.start()
 
     def tearDown(self):
         self.preflight.stop()
+        self.backend.stop()
         self.credentials.stop()
         self.temp.cleanup()
 
@@ -136,6 +141,57 @@ class EditorSidecarTest(unittest.TestCase):
         self.assertIn("event: harness_observation", body)
         self.assertIn("event: harness_result", body)
         self.assertIn("event: done", body)
+
+
+    def test_get_configure_reports_credential_store_and_legacy_fields(self):
+        response = self.client.get("/v1/configure", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["credential_store"], "macos")
+        self.assertIn("has_api_key", body)
+        self.assertEqual(body["protocol_version"], 1)
+        for key in ("response_language", "base_url", "model", "vision_model"):
+            self.assertIn(key, body)
+
+    def test_get_configure_degrades_when_keychain_read_fails(self):
+        with patch.object(sidecar_module, "credential",
+                          side_effect=CredentialError("无法读取 macOS 钥匙串（状态码 -25308）")):
+            response = self.client.get("/v1/configure", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["has_api_key"])
+        self.assertIn("-25308", response.json()["credential_error"])
+
+    def test_post_configure_writes_key_only_when_present(self):
+        with patch.object(sidecar_module, "credential", return_value="") as cred:
+            response = self.client.post("/v1/configure", headers=self.headers,
+                                        json={"api_key": "sk-test", "base_url": "http://x"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["credential_store"], "macos")
+        cred.assert_any_call("api_key", "sk-test")
+
+    def test_post_configure_without_key_only_reads(self):
+        with patch.object(sidecar_module, "credential", return_value="") as cred:
+            response = self.client.post("/v1/configure", headers=self.headers, json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        cred.assert_called_once_with("api_key")
+
+    def test_post_configure_write_failure_returns_500_without_key(self):
+        with patch.object(sidecar_module, "credential",
+                          side_effect=CredentialError("无法写入 macOS 钥匙串（状态码 -25308）")):
+            response = self.client.post("/v1/configure", headers=self.headers,
+                                        json={"api_key": "sk-秘密"})
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("钥匙串", response.json()["detail"])
+        self.assertNotIn("sk-秘密", response.text)
+
+    def test_configure_rejects_change_while_task_running(self):
+        Runtime.run_lock.acquire()
+        try:
+            response = self.client.post("/v1/configure", headers=self.headers,
+                                        json={"base_url": "http://x"})
+        finally:
+            Runtime.run_lock.release()
+        self.assertEqual(response.status_code, 409)
 
 
 if __name__ == "__main__":
