@@ -95,5 +95,87 @@ class WindowsCredentialTest(unittest.TestCase):
         self.api.CredFree.assert_called_once()
 
 
+class MacOSCredentialTest(unittest.TestCase):
+    def setUp(self):
+        self.security = MagicMock()
+        self.corefoundation = MagicMock()
+        self.patches = [
+            patch.object(ec.sys, "platform", "darwin"),
+            patch.object(ec.os, "name", "posix"),
+            patch.object(ec, "_load_macos_security", return_value=self.security),
+            patch.object(ec, "_load_macos_corefoundation", return_value=self.corefoundation),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+
+    def test_write_success_calls_add_with_service_and_utf8(self):
+        def fake_add(keychain, slen, service, alen, account, plen, data, out):
+            self.assertEqual(service, b"Godot/VibeAgent/api_key")
+            self.assertEqual(account, b"VibeAgent")
+            out._obj.value = 0x1234
+            return ec.ERR_SEC_SUCCESS
+
+        self.security.SecKeychainAddGenericPassword.side_effect = fake_add
+        self.assertEqual(ec.credential("api_key", "sk-秘密"), "sk-秘密")
+        self.corefoundation.CFRelease.assert_called_once()
+        self.assertEqual(self.corefoundation.CFRelease.call_args.args[0].value, 0x1234)
+
+    def test_write_duplicate_updates_then_releases(self):
+        self.security.SecKeychainAddGenericPassword.return_value = ec.ERR_SEC_DUPLICATE_ITEM
+
+        def fake_find(keychain, slen, service, alen, account, plen, pdata, out):
+            out._obj.value = 0x5678
+            return ec.ERR_SEC_SUCCESS
+
+        self.security.SecKeychainFindGenericPassword.side_effect = fake_find
+        self.security.SecKeychainItemModifyContent.return_value = ec.ERR_SEC_SUCCESS
+        self.assertEqual(ec.credential("api_key", "sk-new"), "sk-new")
+        self.security.SecKeychainItemModifyContent.assert_called_once()
+        self.corefoundation.CFRelease.assert_called_once()
+        self.assertEqual(self.corefoundation.CFRelease.call_args.args[0].value, 0x5678)
+
+    def test_read_not_found_returns_empty(self):
+        self.security.SecKeychainFindGenericPassword.return_value = ec.ERR_SEC_ITEM_NOT_FOUND
+        self.assertEqual(ec.credential("api_key"), "")
+        self.security.SecKeychainItemFreeContent.assert_not_called()
+
+    def test_read_auth_failed_raises_without_secret(self):
+        self.security.SecKeychainFindGenericPassword.return_value = -25293
+        with self.assertRaises(ec.CredentialError) as ctx:
+            ec.credential("api_key")
+        self.assertIn("-25293", str(ctx.exception))
+        self.security.SecKeychainItemFreeContent.assert_not_called()
+
+    def test_read_success_decodes_utf8_and_frees(self):
+        payload = "sk-读回".encode("utf-8")
+        buffer = ctypes.create_string_buffer(payload)
+
+        def fake_find(keychain, slen, service, alen, account, plen, pdata, out):
+            plen._obj.value = len(payload)
+            pdata._obj.value = ctypes.addressof(buffer)
+            out._obj.value = 0x9abc
+            return ec.ERR_SEC_SUCCESS
+
+        self.security.SecKeychainFindGenericPassword.side_effect = fake_find
+        self.assertEqual(ec.credential("api_key"), "sk-读回")
+        self.security.SecKeychainItemFreeContent.assert_called_once()
+        self.corefoundation.CFRelease.assert_called_once()
+
+    def test_write_failure_raises_without_secret(self):
+        self.security.SecKeychainAddGenericPassword.return_value = -25308
+        with self.assertRaises(ec.CredentialError) as ctx:
+            ec.credential("api_key", "sk-秘密")
+        self.assertNotIn("sk-秘密", str(ctx.exception))
+
+    def test_no_plaintext_fallback_on_unknown_status(self):
+        self.security.SecKeychainFindGenericPassword.return_value = -1
+        with self.assertRaises(ec.CredentialError):
+            ec.credential("api_key")
+
+
 if __name__ == "__main__":
     unittest.main()
