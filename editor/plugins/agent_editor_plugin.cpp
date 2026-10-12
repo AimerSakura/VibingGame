@@ -1034,7 +1034,7 @@ void AgentWorkspace::_start_sidecar() {
 	missing_message = _u8("当前平台不支持 Agent 后台");
 #endif
 
-	if (executable.is_empty() || (!script.is_empty() && !FileAccess::exists(script))) {
+	if (!FileAccess::exists(executable) || (!script.is_empty() && !FileAccess::exists(script))) {
 		_set_status(missing_message, true);
 		return;
 	}
