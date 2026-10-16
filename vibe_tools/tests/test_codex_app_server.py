@@ -25,6 +25,77 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "fake_codex_app_server.
 FAKE_TOKEN = "AT-FAKE-TOKEN-0123456789"
 FAKE_MODEL = "gpt-5.1-codex"
 
+#: Self-contained offline app-server used to exercise turn-id recording.  It is
+#: generated into the per-test temporary directory so the shared fixture stays
+#: untouched.  ``INLINE_FAKE_MODE`` selects how the single turn terminates.
+INLINE_FAKE_SOURCE = r'''#!/usr/bin/env python3
+"""Minimal offline app-server that exercises turn-id recording."""
+import json
+import os
+import sys
+
+TURN_ID = "turn-inline-1"
+THREAD_ID = "thread-inline-1"
+TRANSCRIPT = os.environ.get("INLINE_FAKE_TRANSCRIPT")
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def record(message):
+    if not TRANSCRIPT:
+        return
+    with open(TRANSCRIPT, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": "recv", "msg": message}) + "\n")
+
+
+def main():
+    mode = os.environ.get("INLINE_FAKE_MODE", "interrupt")
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            continue
+        record(message)
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "initialize":
+            send({"id": request_id, "result": {}})
+        elif method == "initialized":
+            continue
+        elif method == "thread/start":
+            send({"id": request_id, "result": {"thread": {"id": THREAD_ID}}})
+        elif method == "turn/start":
+            send({"id": request_id, "result": {"turn": {"id": TURN_ID}}})
+            send({"method": "turn/started",
+                  "params": {"threadId": THREAD_ID, "turn": {"id": TURN_ID}}})
+            send({"method": "item/agentMessage/delta",
+                  "params": {"threadId": THREAD_ID, "delta": "partial", "itemId": "msg-1"}})
+            if mode == "complete":
+                send({"method": "turn/completed",
+                      "params": {"threadId": THREAD_ID,
+                                 "turn": {"id": TURN_ID, "status": "completed"}}})
+            elif mode == "failed":
+                send({"method": "turn/completed",
+                      "params": {"threadId": THREAD_ID,
+                                 "turn": {"id": TURN_ID, "status": "failed",
+                                          "error": {"message": "boom"}}}})
+        elif method == "turn/interrupt":
+            send({"id": request_id, "result": {}})
+            send({"method": "turn/completed",
+                  "params": {"threadId": THREAD_ID,
+                             "turn": {"id": TURN_ID, "status": "interrupted"}}})
+
+
+if __name__ == "__main__":
+    main()
+'''
+
 
 def _launcher(fixture: Path, workdir: str) -> str:
     """Return an executable that runs the fixture on every platform."""
@@ -415,6 +486,144 @@ class TurnEventTest(unittest.TestCase):
         self.assertIsNone(event.item_id)
         self.assertIsNone(event.status)
         self.assertIsNone(event.message)
+
+
+class TurnIdTest(_ServerTestCase):
+    """Turn-id recording, read-only lookup and terminal cleanup."""
+
+    def _inline_server(
+        self, mode: str = "interrupt", timeout: float = 5.0
+    ) -> CodexAppServer:
+        fake = Path(self.temp.name) / "inline_fake_codex_app_server.py"
+        fake.write_text(INLINE_FAKE_SOURCE, encoding="utf-8")
+        env = dict(os.environ)
+        env["INLINE_FAKE_MODE"] = mode
+        env["INLINE_FAKE_TRANSCRIPT"] = str(self.transcript)
+        return CodexAppServer(
+            codex_exe=_launcher(fake, self.temp.name),
+            cwd=self.temp.name,
+            access_token=FAKE_TOKEN,
+            model=FAKE_MODEL,
+            env=env,
+            log=self.logs.append,
+            request_timeout=timeout,
+        )
+
+    def test_turn_id_from_turn_start_response_shapes(self):
+        # Common response shapes for turn/start results.
+        self.assertEqual(CodexAppServer._turn_id_from({"turn": {"id": "turn-1"}}), "turn-1")
+        self.assertEqual(
+            CodexAppServer._turn_id_from({"turn": {"turnId": "turn-2"}}), "turn-2"
+        )
+        self.assertEqual(CodexAppServer._turn_id_from({"turnId": "turn-3"}), "turn-3")
+        self.assertEqual(CodexAppServer._turn_id_from({"turn_id": "turn-4"}), "turn-4")
+        self.assertEqual(CodexAppServer._turn_id_from({"id": "turn-5"}), "turn-5")
+        self.assertIsNone(CodexAppServer._turn_id_from({}))
+        self.assertIsNone(CodexAppServer._turn_id_from({"turn": {}}))
+        self.assertIsNone(CodexAppServer._turn_id_from("not-a-dict"))
+
+    def test_current_turn_id_defaults_to_none(self):
+        server = self._server()
+        self.assertIsNone(server.current_turn_id("unknown-thread"))
+        self.assertIsNone(server.current_turn_id(""))
+
+    def test_interrupt_without_recorded_turn_id_raises(self):
+        server = self._server()
+        with self.assertRaises(CodexAppServerError):
+            server.interrupt("unknown-thread")
+
+    def test_turn_started_notification_records_supported_shapes(self):
+        server = self._server()
+        server._handle_message(
+            {"method": "turn/started", "params": {"threadId": "t-flat", "turnId": "turn-flat"}}
+        )
+        self.assertEqual(server.current_turn_id("t-flat"), "turn-flat")
+        server._handle_message(
+            {
+                "method": "turn/started",
+                "params": {"thread_id": "t-snake", "turn_id": "turn-snake"},
+            }
+        )
+        self.assertEqual(server.current_turn_id("t-snake"), "turn-snake")
+        server._handle_message(
+            {
+                "method": "turn/started",
+                "params": {"threadId": "t-nested", "turn": {"id": "turn-nested"}},
+            }
+        )
+        self.assertEqual(server.current_turn_id("t-nested"), "turn-nested")
+        # Unknown notifications must stay ignored and must not record anything.
+        server._handle_message({"method": "turn/unknown", "params": {"threadId": "t-flat"}})
+        self.assertEqual(server.current_turn_id("t-flat"), "turn-flat")
+
+    def test_turn_start_response_records_and_interrupt_uses_current(self):
+        server = self._inline_server("interrupt")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            self.assertIsNone(server.current_turn_id(thread_id))
+            generator = server.run_turn(thread_id, "go")
+            first = next(generator)
+            self.assertEqual(first.kind, "agent_delta")
+            # Recorded from the turn/start response (and turn/started).
+            self.assertEqual(server.current_turn_id(thread_id), "turn-inline-1")
+            server.interrupt(thread_id)  # turn_id omitted -> current record
+            events = list(generator)
+            self.assertEqual(events[-1].kind, "turn_completed")
+            self.assertEqual(events[-1].status, "interrupted")
+            interrupts = [
+                message
+                for message in self._received()
+                if message.get("method") == "turn/interrupt"
+            ]
+            self.assertEqual(len(interrupts), 1)
+            self.assertEqual(interrupts[0]["params"]["threadId"], thread_id)
+            self.assertEqual(interrupts[0]["params"]["turnId"], "turn-inline-1")
+            # Terminal state clears the record.
+            self.assertIsNone(server.current_turn_id(thread_id))
+            self._assert_no_token()
+        finally:
+            server.stop()
+
+    def test_turn_completion_clears_current_turn_id(self):
+        server = self._inline_server("complete")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            generator = server.run_turn(thread_id, "go")
+            first = next(generator)
+            self.assertEqual(first.kind, "agent_delta")
+            self.assertEqual(server.current_turn_id(thread_id), "turn-inline-1")
+            events = list(generator)
+            self.assertEqual(events[-1].kind, "turn_completed")
+            self.assertIsNone(server.current_turn_id(thread_id))
+        finally:
+            server.stop()
+
+    def test_turn_failure_clears_current_turn_id(self):
+        server = self._inline_server("failed")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            generator = server.run_turn(thread_id, "go")
+            first = next(generator)
+            self.assertEqual(first.kind, "agent_delta")
+            self.assertEqual(server.current_turn_id(thread_id), "turn-inline-1")
+            events = list(generator)
+            self.assertEqual(events[-1].kind, "error")
+            self.assertEqual(events[-1].status, "failed")
+            self.assertIsNone(server.current_turn_id(thread_id))
+        finally:
+            server.stop()
+
+    def test_exit_clears_current_turn_id(self):
+        server = self._server()
+        server._handle_message(
+            {"method": "turn/started", "params": {"threadId": "t-exit", "turnId": "turn-exit"}}
+        )
+        self.assertEqual(server.current_turn_id("t-exit"), "turn-exit")
+        server._mark_closed()
+        self.assertIsNone(server.current_turn_id("t-exit"))
 
 
 if __name__ == "__main__":  # pragma: no cover

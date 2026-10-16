@@ -119,6 +119,8 @@ class CodexAppServer:
         self._pending: dict[Any, _Pending] = {}
         self._turn_lock = threading.Lock()
         self._turn_queues: dict[str, "queue.Queue"] = {}
+        self._turn_id_lock = threading.Lock()
+        self._turn_ids: dict[str, str] = {}
         self._id_source = count(1)
 
         self._closed = threading.Event()
@@ -321,10 +323,16 @@ class CodexAppServer:
                 )
             self._turn_queues[thread_id] = turn_queue
         try:
-            self._request(
+            result = self._request(
                 "turn/start",
                 {"threadId": thread_id, "input": [{"type": "text", "text": text}]},
             )
+            # Prefer the synchronous turn/start response; a turn/started
+            # notification handled by the reader thread may already have
+            # recorded the same id.
+            turn_id = self._turn_id_from(result)
+            if turn_id:
+                self._record_turn_id(thread_id, turn_id)
             while True:
                 item = turn_queue.get()
                 if item is _CLOSED:
@@ -339,8 +347,27 @@ class CodexAppServer:
             with self._turn_lock:
                 if self._turn_queues.get(thread_id) is turn_queue:
                     del self._turn_queues[thread_id]
+            # Any terminal outcome (completed/failed/interrupted) ends the turn.
+            self._clear_turn_id(thread_id)
 
-    def interrupt(self, thread_id: str, turn_id: str) -> None:
+    def current_turn_id(self, thread_id: str) -> str | None:
+        """Return the last turn id observed for ``thread_id``, if any.
+
+        This is read-only and non-sensitive: it never exposes prompts or
+        credentials, and it returns ``None`` once the turn has reached a
+        terminal state or the process exited.
+        """
+        if not isinstance(thread_id, str) or not thread_id:
+            return None
+        with self._turn_id_lock:
+            return self._turn_ids.get(thread_id)
+
+    def interrupt(self, thread_id: str, turn_id: str | None = None) -> None:
+        """Interrupt the turn; ``turn_id=None`` uses the recorded current turn."""
+        if turn_id is None:
+            turn_id = self.current_turn_id(thread_id)
+        if not turn_id:
+            raise CodexAppServerError(f"no active turn recorded for thread {thread_id}")
         self._request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
 
     # ------------------------------------------------------------------
@@ -416,6 +443,8 @@ class CodexAppServer:
 
     def _dispatch_notification(self, method: str, params: dict) -> None:
         thread_id = self._notification_thread_id(params)
+        if method == "turn/started":
+            self._record_started_turn(thread_id, params)
         with self._turn_lock:
             target = self._turn_queues.get(thread_id) if thread_id is not None else None
             if target is None and len(self._turn_queues) == 1:
@@ -424,6 +453,31 @@ class CodexAppServer:
                 target = next(iter(self._turn_queues.values()))
         if target is not None:
             target.put((method, params))
+
+    def _record_started_turn(self, thread_id: str | None, params: dict) -> None:
+        turn_id = self._turn_id_from(params)
+        if not turn_id:
+            return
+        if thread_id is None:
+            with self._turn_lock:
+                if len(self._turn_queues) == 1:
+                    thread_id = next(iter(self._turn_queues))
+        if thread_id is not None:
+            self._record_turn_id(thread_id, turn_id)
+
+    def _record_turn_id(self, thread_id: str, turn_id: str) -> None:
+        if not isinstance(thread_id, str) or not thread_id:
+            return
+        if not isinstance(turn_id, str) or not turn_id:
+            return
+        with self._turn_id_lock:
+            self._turn_ids[thread_id] = turn_id
+
+    def _clear_turn_id(self, thread_id: str) -> None:
+        if not isinstance(thread_id, str) or not thread_id:
+            return
+        with self._turn_id_lock:
+            self._turn_ids.pop(thread_id, None)
 
     def _mark_closed(self) -> None:
         with self._on_closed_lock:
@@ -440,6 +494,8 @@ class CodexAppServer:
             turn_queues = list(self._turn_queues.values())
         for turn_queue in turn_queues:
             turn_queue.put(_CLOSED)
+        with self._turn_id_lock:
+            self._turn_ids.clear()
 
     # ------------------------------------------------------------------
     # notification mapping helpers
@@ -467,6 +523,28 @@ class CodexAppServer:
                 if isinstance(value, str) and value:
                     return value
         for key in ("threadId", "thread_id", "id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    @staticmethod
+    def _turn_id_from(payload: Any) -> str | None:
+        """Extract a turn id from a turn/start result or turn/started params.
+
+        Tries the nested ``turn`` object first, then the flat ``turnId`` /
+        ``turn_id`` / ``id`` keys.  Returns ``None`` for unknown shapes so
+        callers can safely ignore them.
+        """
+        if not isinstance(payload, dict):
+            return None
+        turn = payload.get("turn")
+        if isinstance(turn, dict):
+            for key in ("id", "turnId", "turn_id"):
+                value = turn.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        for key in ("turnId", "turn_id", "id"):
             value = payload.get(key)
             if isinstance(value, str) and value:
                 return value
