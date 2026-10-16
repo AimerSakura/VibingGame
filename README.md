@@ -32,6 +32,23 @@ API Key 使用 Windows 凭据管理器保存；模型地址、名称和回答语
 
 发布包的使用者无需安装 Python。模型请求会发送到你配置的服务；代码上下文、需求及视觉测试截图可能作为请求内容发送。
 
+## 账号与登录方式
+
+Agent 支持两种模型接入方式，可在顶部 **设置** 弹窗中切换：
+
+| 方式 | 适用平台 | 说明 |
+| --- | --- | --- |
+| API Key | Windows 与 macOS | 填写兼容模型服务的接口地址、主模型、视觉模型和 API Key |
+| ChatGPT / Codex | 首发支持 macOS arm64（Apple 芯片），Windows 暂不提供 | 不需要 OpenAI API Key，使用 ChatGPT 账号登录 |
+
+**API Key 模式**：在“设置”中填写接口地址、模型名称和 API Key 后保存。API Key 由操作系统凭据存储保管（Windows 凭据管理器；macOS 登录钥匙串），不写入项目、启动参数、环境变量、SSE 或日志。
+
+**ChatGPT / Codex 模式**：点击 **Sign in with ChatGPT**，在浏览器中完成授权；如果账号下包含多个可用账号，再按提示选择要使用的账号。登录后设置界面会显示账号元数据（如账号标识与名称）。需要时可以切换账号，或退出登录 / 撤销授权；退出或撤销后需重新登录才能继续使用该模式。该模式不需要 OpenAI API Key。
+
+无论使用哪种模式，OAuth、访问令牌、刷新令牌和 ID 令牌都不会写入项目文件、命令行参数、环境变量、SSE 事件或日志，仅保存在操作系统凭据存储中（macOS 登录钥匙串；Windows 凭据管理器用于 API Key）。界面、日志和文档不会展示任何真实令牌、授权码、Cookie 或授权地址。
+
+macOS arm64 是首个支持 **Sign in with ChatGPT** 的平台；Windows 版本仍仅支持 API Key 模式，现有 Windows PowerShell 构建与打包脚本及其行为保持不变。
+
 ## 自动测试与回修
 
 每次 Agent 实际修改项目文件后，自动生成 3～6 个与修改相关的测试点，覆盖正常操作、边界行为和相关回归。没有文件修改的对话不触发测试；手动保存只会使相关验证结果过期。
@@ -192,9 +209,9 @@ bash misc/vibe_agent/package_macos.sh
 open .build/VibeGodot-macOS-arm64/VibeGodot.app
 ```
 
-API Key 保存在 macOS 登录钥匙串的 `Godot/VibeAgent/api_key` 条目中，不写入项目、启动参数、环境变量或日志；模型地址、名称、视觉模型和回答语言等非敏感项保存在编辑器设置（Editor Settings）中。分发时需要保留 `.app` 内的全部文件；目标机器无需安装 Python。
+API Key 保存在 macOS 登录钥匙串的 `Godot/VibeAgent/api_key` 条目中，不写入项目、启动参数、环境变量或日志；模型地址、名称、视觉模型和回答语言等非敏感项保存在编辑器设置（Editor Settings）中。打包时会把经过校验、版本固定的 Codex app-server 发布件随 `.app` 一起分发，供 **Sign in with ChatGPT** 登录使用；使用者仍需使用完整发布包，分发时需要保留 `.app` 内的全部文件，目标机器无需安装 Python。
 
-> **未签名 / 未公证**：当前发布包不包含代码签名和公证，仅支持 arm64。从网络下载后 macOS Gatekeeper 可能阻止打开并标记 quarantine；确认来源可信后，可在“系统设置 → 隐私与安全性”中选择仍要打开，或执行 `xattr -dr com.apple.quarantine <VibeGodot.app>`（可选的用户操作）。
+> **未签名 / 未公证**：当前发布包不包含代码签名和公证，仅支持 arm64。从网络下载后 macOS Gatekeeper 可能阻止打开并标记 quarantine；确认来源可信后，可在“系统设置 → 隐私与安全性”中选择仍要打开，或执行 `xattr -dr com.apple.quarantine <VibeGodot.app>`。是否绕过或允许打开由用户自行决定。
 
 ## 开发验证
 

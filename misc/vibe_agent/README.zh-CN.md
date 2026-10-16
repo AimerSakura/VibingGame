@@ -40,6 +40,19 @@ Tests 分别展示行为断言、视觉判断和运行诊断。仅在进程正�
 
 测试自动修订与游戏自动回修各自最多 3 轮。修订保留 ID、启用/必选状态及视觉覆盖，原始需求不变；旧计划保存在 `plan_history`，原始逐轮报告保留。Tests 显示审查理由和证据，计划中的 `review_history` 记录修订前后方案，`plan_revision` 记录测试修订轮次。游戏修复 Agent 仍无权自行删除或弱化测试。
 
+## 账号与登录方式
+
+编辑器支持两种模型接入方式，可在顶部“设置”弹窗中切换：
+
+- **API Key 模式**：填写兼容模型服务的接口地址、主模型、视觉模型和 API Key。API Key 由操作系统凭据存储保管：Windows 使用凭据管理器，macOS 使用登录钥匙串（login Keychain）。
+- **ChatGPT / Codex 模式**：无需 OpenAI API Key。点击设置中的 **Sign in with ChatGPT**，按提示在浏览器中打开授权页面并点击 **Continue with ChatGPT** 完成授权；如果账号下有多个可用账号，再按提示选择要使用的账号。
+
+登录后设置界面会显示账号元数据（账号标识、名称等）。需要时可以切换账号，或退出登录 / 撤销授权；退出或撤销后需重新登录才能继续使用 ChatGPT 模式。
+
+OAuth 令牌、访问令牌、刷新令牌和 ID 令牌都不会写入项目文件、启动参数、环境变量、SSE 或日志，只保存在操作系统凭据存储中。界面、日志和文档不会展示任何真实令牌、授权码、Cookie 或授权地址。
+
+macOS arm64 是首个支持 **Sign in with ChatGPT** 的平台；Windows 版本仍仅支持 API Key 模式，现有 Windows PowerShell 脚本及其行为保持不变。
+
 ## macOS arm64 使用说明
 
 macOS 版本仅支持 arm64（Apple 芯片）。构建并打包后，运行 `.build/VibeGodot-macOS-arm64/VibeGodot.app`，在原生项目管理器中打开或新建项目。普通编辑器启动后会自动进入顶部 **Agent** 工作区；项目管理器、无头模式和恢复模式不会启动 Agent 后台。
@@ -47,6 +60,6 @@ macOS 版本仅支持 arm64（Apple 芯片）。构建并打包后，运行 `.bu
 1. 点击顶部“设置”，在弹窗中填写兼容模型服务的接口地址、主模型、视觉模型和 API Key，点击“保存设置”。API Key 使用 macOS 钥匙串保存（登录钥匙串中的 `Godot/VibeAgent/api_key` 条目），不写入项目、启动参数、环境变量或日志；接口地址、模型名称和回答语言等非敏感项保存在编辑器设置中。
 2. 对话、参考图片、隔离修改、回退、Tests 与自动回修流程与 Windows 相同，操作步骤与判定规则见上方 Windows 段落。
 
-后台组件随包位于 `VibeGodot.app/Contents/Resources/vibe_agent/godotvibe-agent/godotvibe-agent`（无 `.exe` 后缀，也不是嵌套 `.app`），为 PyInstaller onedir 组件，运行机器无需安装 Python。每个编辑器实例启动独立 sidecar，监听 `127.0.0.1` 随机端口并使用独立 256 位令牌；编辑器退出时先请求正常关闭，超时后强制清理。诊断日志位于当前项目 `.godot/agent/sidecar.log`。
+后台组件随包位于 `VibeGodot.app/Contents/Resources/vibe_agent/godotvibe-agent/godotvibe-agent`（无 `.exe` 后缀，也不是嵌套 `.app`），为 PyInstaller onedir 组件，运行机器无需安装 Python。打包时还会把经过校验、版本固定的 Codex app-server 发布件随 `.app` 一起分发，用于 ChatGPT / Codex 登录；使用者仍需使用完整发布包，不能只复制编辑器可执行文件。每个编辑器实例启动独立 sidecar，监听 `127.0.0.1` 随机端口并使用独立 256 位令牌；编辑器退出时先请求正常关闭，超时后强制清理。诊断日志位于当前项目 `.godot/agent/sidecar.log`。
 
-构建命令：`bash misc/vibe_agent/build_sidecar.sh` 生成 arm64 onedir 后台，`bash misc/vibe_agent/package_macos.sh` 组装 `.build/VibeGodot-macOS-arm64/VibeGodot.app` 与 `.build/VibeGodot-macOS-arm64.zip`。当前产物未签名、未公证，仅支持 arm64；从网络下载后可能被 Gatekeeper 与 quarantine 拦截，确认来源可信后可在“系统设置 → 隐私与安全性”中允许打开，或执行 `xattr -dr com.apple.quarantine <VibeGodot.app>`。
+构建命令：`bash misc/vibe_agent/build_sidecar.sh` 生成 arm64 onedir 后台，`bash misc/vibe_agent/package_macos.sh` 组装 `.build/VibeGodot-macOS-arm64/VibeGodot.app` 与 `.build/VibeGodot-macOS-arm64.zip`。当前产物未签名、未公证，仅支持 arm64；从网络下载后可能被 Gatekeeper 与 quarantine 拦截，确认来源可信后可在“系统设置 → 隐私与安全性”中允许打开，或执行 `xattr -dr com.apple.quarantine <VibeGodot.app>`；是否绕过或允许打开由用户自行决定。
