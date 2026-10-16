@@ -536,6 +536,12 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 			chatgpt_account_label.clear();
 			chatgpt_account_email.clear();
 			chatgpt_plan_enabled = true;
+#if defined(MACOS_ENABLED)
+			if (auth_mode) {
+				// 退出后 sidecar 回退 API Key，下拉必须显式同步，避免 UI 仍显示 ChatGPT 而已用 API Key。
+				auth_mode->select(0);
+			}
+#endif
 			_update_chatgpt_ui();
 			_set_status(_u8("已退出 ChatGPT 登录"));
 			_push_configuration(false);
@@ -977,15 +983,26 @@ void AgentWorkspace::_cancel_chatgpt_login() {
 	if (!chatgpt_login_active || chatgpt_login_id.is_empty()) {
 		return;
 	}
-	String login_id = chatgpt_login_id;
-	// 先本地停止轮询并清理 login_id，即使 cancel 请求无法发出也不遗留轮询。
+	// 先捕获 login_id，再本地停止轮询并清理 login_id；cancel 请求通过待发送标志排队，
+	// 避免与正在飞行的 status 请求并发复用共享 HTTPRequest，也避免旧 status 响应被误当成 cancel 响应。
+	chatgpt_cancel_login_id = chatgpt_login_id;
+	chatgpt_cancel_pending = true;
 	_finish_chatgpt_login();
 	_set_status(_u8("已取消 ChatGPT 登录"));
-	if (request_kind == REQUEST_NONE) {
-		Dictionary body;
-		body["login_id"] = login_id;
-		_request("/v1/auth/chatgpt/cancel", HTTPClient::METHOD_POST, body, REQUEST_CHATGPT_CANCEL);
+	_flush_pending_chatgpt_cancel();
+}
+
+void AgentWorkspace::_flush_pending_chatgpt_cancel() {
+	if (!chatgpt_cancel_pending || request_kind != REQUEST_NONE || backend_url.is_empty()) {
+		return;
 	}
+	// 取出并清除待发送状态：同一 login_id 只补发一次，且即使请求失败也绝不恢复轮询。
+	String login_id = chatgpt_cancel_login_id;
+	chatgpt_cancel_pending = false;
+	chatgpt_cancel_login_id.clear();
+	Dictionary body;
+	body["login_id"] = login_id;
+	_request("/v1/auth/chatgpt/cancel", HTTPClient::METHOD_POST, body, REQUEST_CHATGPT_CANCEL);
 }
 
 void AgentWorkspace::_logout_chatgpt() {
@@ -1489,6 +1506,9 @@ void AgentWorkspace::_stop_sidecar() {
 		request_kind = REQUEST_NONE;
 	}
 	// 后台停止时终止 ChatGPT 轮询并清理短期 login_id；账号 metadata 允许保留展示。
+	// sidecar 一旦停止/重启，旧的 login_id 与排队中的 cancel 都已失效，必须一并清理。
+	chatgpt_cancel_pending = false;
+	chatgpt_cancel_login_id.clear();
 	_finish_chatgpt_login();
 	config_state_loaded = false;
 	config_state_retry = 0.0;
@@ -1558,6 +1578,8 @@ void AgentWorkspace::_notification(int p_what) {
 		}
 		_process_stream(delta);
 		_process_chatgpt_poll(delta);
+		// status 轮询结束后在空闲帧补发排队的 cancel，保证取消请求最终只发送一次。
+		_flush_pending_chatgpt_cancel();
 		if (backend_ready && !config_state_loaded) {
 			config_state_retry -= delta;
 			if (config_state_retry <= 0.0) {
