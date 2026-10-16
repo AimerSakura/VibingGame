@@ -187,17 +187,47 @@ function Get-ManifestDigest {
     return $null
 }
 
+# Parse codex-package.json and return it only when it is a JSON object. A
+# missing file, empty/whitespace-only content, malformed JSON, or a top-level
+# value that is not an object (array, string, number, boolean or null) all
+# return $null so callers fail closed. The version/target fields remain
+# optional members of that object.
 function Read-PackageManifest {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return $null
     }
+    $raw = $null
     try {
-        return (Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json)
+        $raw = Get-Content -LiteralPath $Path -Raw
+    } catch {
+        Write-Warning "cannot read codex-package.json at $Path"
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        Write-Warning "codex-package.json is empty at $Path"
+        return $null
+    }
+    # A JSON object is the only accepted top-level shape. Checking the first
+    # non-whitespace character also rejects arrays that ConvertFrom-Json may
+    # unwrap to a single object in Windows PowerShell 5.1.
+    if (-not ($raw -match '^\uFEFF?\s*\{')) {
+        Write-Warning "codex-package.json at $Path is not a JSON object"
+        return $null
+    }
+    try {
+        $manifest = ConvertFrom-Json -InputObject $raw
     } catch {
         Write-Warning "cannot parse codex-package.json at $Path"
         return $null
     }
+    # ConvertFrom-Json also accepts JSON arrays and scalars; require the parsed
+    # top-level value to be an object as well.
+    if ($null -eq $manifest -or -not ($manifest -is [System.Management.Automation.PSCustomObject])) {
+        Write-Warning "codex-package.json at $Path is not a JSON object"
+        return $null
+    }
+    return $manifest
 }
 
 function Get-ManifestField {
@@ -319,6 +349,10 @@ function Test-CodexLayout {
     }
 
     $manifest = Read-PackageManifest -Path $packageJson
+    if ($null -eq $manifest) {
+        Write-Warning "invalid codex-package.json in $Layout"
+        return $null
+    }
     $manifestVersion = Get-ManifestField -Manifest $manifest -Name "version"
     $manifestTarget = Get-ManifestField -Manifest $manifest -Name "target"
 
