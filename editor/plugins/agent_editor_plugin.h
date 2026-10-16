@@ -105,6 +105,10 @@ class AgentWorkspace : public VBoxContainer {
 	String last_prompt;
 	// ChatGPT 认证由 sidecar 托管：编辑器只保存短期 login_id/account_id 与展示用 metadata。
 	String chatgpt_login_id;
+	// 取消登录时，status 轮询可能正占用共享 HTTPRequest；这里排队一次待发送的 cancel，
+	// 等当前请求结束、request_kind 归位后再补发，避免并发复用同一 HTTPRequest。
+	bool chatgpt_cancel_pending = false;
+	String chatgpt_cancel_login_id;
 	String chatgpt_account_id;
 	String chatgpt_account_label;
 	String chatgpt_account_email;
@@ -163,6 +167,7 @@ class AgentWorkspace : public VBoxContainer {
 	void _refresh_config_state();
 	void _start_chatgpt_login();
 	void _cancel_chatgpt_login();
+	void _flush_pending_chatgpt_cancel();
 	void _logout_chatgpt();
 	void _process_chatgpt_poll(double p_delta);
 	void _handle_chatgpt_status_response(const Dictionary &p_response);
