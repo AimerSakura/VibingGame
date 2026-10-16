@@ -696,19 +696,30 @@ _CHATGPT_UNSUPPORTED = "ChatGPT sign-in is not supported on this platform yet"
 _MAX_JWKS_BYTES = 64 * 1024
 
 
-def _is_macos() -> bool:
-    return sys.platform == "darwin"
+def _is_chatgpt_platform() -> bool:
+    """Platforms that ship a usable Codex ChatGPT runtime.
+
+    macOS arm64 and Windows x86_64 bundle the Codex app-server used for Sign in
+    with ChatGPT. Linux and every other platform stay API Key-only and reject
+    both the ChatGPT configuration and the login endpoints.
+    """
+    return sys.platform in ("darwin", "win32")
+
+
+def _codex_executable_name() -> str:
+    """Name of the bundled Codex executable for the current platform."""
+    return "codex.exe" if sys.platform == "win32" else "codex"
 
 
 def _sidecar_bundle_roots() -> list[Path]:
     """Directories that may contain the bundled Codex layout.
 
     The packaged PyInstaller onedir sidecar runs from
-    ``.../Contents/Resources/vibe_agent/godotvibe-agent/godotvibe-agent`` and
-    the Codex release is copied to
-    ``.../Contents/Resources/vibe_agent/codex``. ``_MEIPASS`` is included
-    because PyInstaller versions differ on whether it points at the executable
-    directory or its private ``_internal`` directory.
+    ``.../Contents/Resources/vibe_agent/godotvibe-agent/godotvibe-agent`` on
+    macOS or ``.../vibe_agent/godotvibe-agent/godotvibe-agent.exe`` on Windows,
+    and the Codex release is copied to ``.../vibe_agent/codex`` beside it.
+    ``_MEIPASS`` is included because PyInstaller versions differ on whether it
+    points at the executable directory or its private ``_internal`` directory.
     """
     roots: list[Path] = []
     anchors: list[Path] = []
@@ -728,8 +739,9 @@ def _sidecar_bundle_roots() -> list[Path]:
 def _bundled_codex_candidates() -> list[str]:
     """Executable candidates for the Codex layout shipped inside the app."""
     candidates: list[str] = []
+    executable_name = _codex_executable_name()
     for root in _sidecar_bundle_roots():
-        candidate = str(root / "codex" / "bin" / "codex")
+        candidate = str(root / "codex" / "bin" / executable_name)
         if candidate not in candidates:
             candidates.append(candidate)
     return candidates
@@ -739,10 +751,11 @@ def _resolve_codex_exe() -> str:
     """Locate a usable codex executable.
 
     Order: ``VIBE_CODEX_BIN`` then ``CODEX_BIN``, then the Codex layout bundled
-    next to the PyInstaller onedir sidecar (``.../vibe_agent/codex/bin/codex``),
-    then the current ``PATH``, then ``~/.local/bin/codex``. Only regular
-    executable files are accepted, and no token, model or working directory is
-    ever appended to the command.
+    next to the PyInstaller onedir sidecar (``.../vibe_agent/codex/bin/codex``
+    on macOS, ``.../vibe_agent/codex/bin/codex.exe`` on Windows), then the
+    current ``PATH``, then ``~/.local/bin/codex``. Only regular executable files
+    are accepted, and no token, model or working directory is ever appended to
+    the command.
     """
     candidates: list[str] = []
     for variable in ("VIBE_CODEX_BIN", "CODEX_BIN"):
@@ -753,7 +766,7 @@ def _resolve_codex_exe() -> str:
     on_path = shutil.which("codex")
     if on_path:
         candidates.append(on_path)
-    candidates.append(os.path.join(os.path.expanduser("~"), ".local", "bin", "codex"))
+    candidates.append(os.path.join(os.path.expanduser("~"), ".local", "bin", _codex_executable_name()))
     for candidate in candidates:
         try:
             if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
@@ -788,7 +801,7 @@ def _codex_version(exe: str) -> str:
 
 def _codex_capability() -> tuple[bool, str]:
     """Return ``(chatgpt_supported, codex_version)`` for the current platform."""
-    if not _is_macos():
+    if not _is_chatgpt_platform():
         return False, ""
     if not Runtime.codex_probed:
         Runtime.codex_exe = _resolve_codex_exe()

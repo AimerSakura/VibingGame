@@ -434,20 +434,9 @@ class ChatGptAuthTest(unittest.TestCase):
         self.assertNotIn("auth_mode", Runtime.config)
         self.assertNotIn("chatgpt_account_id", Runtime.config)
 
-    def test_non_macos_forces_api_key_and_rejects_chatgpt(self):
-        Runtime.codex_probed = False
-        Runtime.codex_exe = "/opt/codex"
-        with patch.object(sidecar_module.sys, "platform", "win32"):
-            body = self.client.get("/v1/configure", headers=self.headers).json()
-            self.assertEqual(body["auth_mode"], "api_key")
-            self.assertFalse(body["chatgpt_supported"])
-            self.assertEqual(body["codex_version"], "")
-            conflict = self.client.post("/v1/configure", headers=self.headers, json={"auth_mode": "chatgpt"})
-            self.assertEqual(conflict.status_code, 409)
-
-    def test_windows_gate_forces_api_key_and_blocks_chatgpt(self):
+    def test_linux_forces_api_key_and_rejects_chatgpt(self):
         self._enable_chatgpt()
-        with patch.object(sidecar_module.sys, "platform", "win32"):
+        with patch.object(sidecar_module.sys, "platform", "linux"):
             body = self.client.get("/v1/configure", headers=self.headers).json()
             self.assertEqual(body["auth_mode"], "api_key")
             self.assertFalse(body["chatgpt_supported"])
@@ -462,6 +451,26 @@ class ChatGptAuthTest(unittest.TestCase):
             self.assertEqual(started.status_code, 409)
         self.assertFalse(
             any(attempt.get("status") == "authorizing" for attempt in Runtime.auth_attempts.values()))
+
+    def test_windows_enables_chatgpt_capability(self):
+        self._enable_chatgpt()
+        with patch.object(sidecar_module.sys, "platform", "win32"):
+            body = self.client.get("/v1/configure", headers=self.headers).json()
+            self.assertTrue(body["chatgpt_supported"])
+            self.assertEqual(body["codex_version"], "1.2.3")
+            self.assertEqual(body["auth_mode"], "api_key")
+
+            response = self.client.post(
+                "/v1/configure", headers=self.headers, json={"auth_mode": "chatgpt"})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["auth_mode"], "chatgpt")
+            self.assertEqual(Runtime.auth_mode, "chatgpt")
+
+            with patch.object(sidecar_module, "_start_login_thread") as starter:
+                started = self.client.post("/v1/auth/chatgpt/start", headers=self.headers, json={})
+        self.assertEqual(started.status_code, 200, started.text)
+        self.assertEqual(started.json()["status"], "authorizing")
+        starter.assert_called_once()
 
     def test_configure_stores_selected_account_id_without_tokens(self):
         self._enable_chatgpt()
@@ -802,6 +811,11 @@ class CodexExeResolutionTest(unittest.TestCase):
         with self._isolated_lookup():
             self.assertEqual(sidecar_module._resolve_codex_exe(), str(self.bundled))
 
+    def test_resolves_bundled_codex_exe_on_windows(self):
+        bundled_exe = self._make_executable(self.vibe_agent / "codex" / "bin" / "codex.exe")
+        with patch.object(sidecar_module.sys, "platform", "win32"), self._isolated_lookup():
+            self.assertEqual(sidecar_module._resolve_codex_exe(), str(bundled_exe))
+
     def test_env_override_takes_precedence_over_bundled(self):
         override = self._make_executable(self.root / "custom" / "codex")
         with patch.dict(os.environ, {"VIBE_CODEX_BIN": str(override)}), self._isolated_lookup():
@@ -822,6 +836,75 @@ class CodexExeResolutionTest(unittest.TestCase):
         path_exe = self._make_executable(self.root / "path-bin" / "codex")
         with self._isolated_lookup(which=str(path_exe)):
             self.assertEqual(sidecar_module._resolve_codex_exe(), str(path_exe))
+
+
+@unittest.skipUnless(os.name != "nt", "temporary Codex stubs use a POSIX shell")
+class CodexCapabilityPlatformTest(unittest.TestCase):
+    """Platform gating for ``_codex_capability`` using real temporary stubs.
+
+    The bundled layout and a working ``codex --version`` script are built under
+    a temporary directory and executed for real, so these tests exercise the
+    resolver and the version probe instead of asserting a mock against itself.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        # Packaged PyInstaller onedir sidecar layout (same shape on macOS/Windows).
+        self.vibe_agent = self.root / "Contents" / "Resources" / "vibe_agent"
+        self.sidecar_dir = self.vibe_agent / "godotvibe-agent"
+        self.sidecar_dir.mkdir(parents=True)
+        self.sidecar_exe = self.sidecar_dir / "godotvibe-agent.exe"
+        self.sidecar_exe.write_bytes(b"stub")
+        self.env = patch.dict(os.environ, {"VIBE_CODEX_BIN": "", "CODEX_BIN": ""})
+        self.env.start()
+        _reset_auth_state()
+        Runtime.codex_probed = False
+
+    def tearDown(self):
+        self.env.stop()
+        _reset_auth_state()
+        self.temp.cleanup()
+
+    @contextlib.contextmanager
+    def _isolated_lookup(self):
+        with patch.object(sidecar_module.sys, "executable", str(self.sidecar_exe)), \
+             patch.object(sidecar_module.sys, "_MEIPASS", "", create=True), \
+             patch.object(sidecar_module.shutil, "which", return_value=None), \
+             patch.object(sidecar_module.os.path, "expanduser", return_value=str(self.root)):
+            yield
+
+    def _install_versioned_codex(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\necho 'codex-cli 1.2.3'\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def test_windows_capability_resolves_bundled_codex_exe(self):
+        exe = self._install_versioned_codex(self.vibe_agent / "codex" / "bin" / "codex.exe")
+        with self._isolated_lookup(), patch.object(sidecar_module.sys, "platform", "win32"):
+            supported, version = sidecar_module._codex_capability()
+        self.assertTrue(supported)
+        self.assertEqual(version, "1.2.3")
+        self.assertEqual(Runtime.codex_exe, str(exe))
+
+    def test_macos_capability_resolves_bundled_codex(self):
+        exe = self._install_versioned_codex(self.vibe_agent / "codex" / "bin" / "codex")
+        with self._isolated_lookup(), patch.object(sidecar_module.sys, "platform", "darwin"):
+            supported, version = sidecar_module._codex_capability()
+        self.assertTrue(supported)
+        self.assertEqual(version, "1.2.3")
+        self.assertEqual(Runtime.codex_exe, str(exe))
+
+    def test_unsupported_platform_never_probes_or_enables(self):
+        # A perfectly valid bundled executable must stay invisible on Linux.
+        self._install_versioned_codex(self.vibe_agent / "codex" / "bin" / "codex")
+        self._install_versioned_codex(self.vibe_agent / "codex" / "bin" / "codex.exe")
+        with self._isolated_lookup(), patch.object(sidecar_module.sys, "platform", "linux"):
+            supported, version = sidecar_module._codex_capability()
+        self.assertFalse(supported)
+        self.assertEqual(version, "")
+        self.assertEqual(Runtime.codex_exe, "")
 
 
 class _FakeCodexProvider:

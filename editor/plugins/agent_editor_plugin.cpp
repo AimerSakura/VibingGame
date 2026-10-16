@@ -336,8 +336,8 @@ void AgentWorkspace::_request(const String &p_path, HTTPClient::Method p_method,
 }
 
 void AgentWorkspace::_push_configuration(bool p_include_key) {
-	// auth_mode 只在 macOS + Codex capability 且已登录账号时才切换为 chatgpt；
-	// 其余情况保持 API Key 流程，确保 Windows/Linux 与旧行为不变。
+	// auth_mode 只在 macOS arm64 / Windows x86_64 + Codex capability 且已登录账号时
+	// 才切换为 chatgpt；其余情况（含 Linux 及其他平台）保持 API Key 流程不变。
 	const bool chatgpt = _chatgpt_mode_active();
 	Dictionary body;
 	body["api_key"] = (p_include_key && !chatgpt) ? api_key->get_text() : String();
@@ -353,7 +353,7 @@ void AgentWorkspace::_push_configuration(bool p_include_key) {
 }
 
 bool AgentWorkspace::_chatgpt_mode_active() const {
-#if defined(MACOS_ENABLED)
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 	if (!auth_mode || !chatgpt_supported || chatgpt_codex_version.is_empty() || chatgpt_account_id.is_empty()) {
 		return false;
 	}
@@ -399,7 +399,7 @@ void AgentWorkspace::_apply_config_state(const Dictionary &p_response) {
 		// sidecar 返回了无法安全使用的账号标识：保持未登录状态。
 		chatgpt_account_id.clear();
 	}
-#if defined(MACOS_ENABLED)
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 	if (auth_mode) {
 		String mode = String(p_response.get("auth_mode", "")).strip_edges().to_lower();
 		if (mode == "chatgpt") {
@@ -417,7 +417,8 @@ void AgentWorkspace::_update_chatgpt_ui() {
 		return;
 	}
 	const bool capable = chatgpt_supported && !chatgpt_codex_version.is_empty();
-	// ChatGPT 选项只在 macOS 且 sidecar 报告 Codex capability 时启用。
+	// ChatGPT 选项只在 macOS arm64 / Windows x86_64 且 sidecar 报告 Codex capability 时启用；
+	// Linux/其他平台 sidecar 返回 chatgpt_supported=false，选项保持禁用并回退 API Key。
 	auth_mode->set_item_disabled(1, !capable);
 	if (!capable && auth_mode->get_selected() == 1) {
 		auth_mode->select(0);
@@ -536,7 +537,7 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 			chatgpt_account_label.clear();
 			chatgpt_account_email.clear();
 			chatgpt_plan_enabled = true;
-#if defined(MACOS_ENABLED)
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 			if (auth_mode) {
 				// 退出后 sidecar 回退 API Key，下拉必须显式同步，避免 UI 仍显示 ChatGPT 而已用 API Key。
 				auth_mode->select(0);
@@ -1063,7 +1064,7 @@ void AgentWorkspace::_handle_chatgpt_status_response(const Dictionary &p_respons
 			return;
 		}
 		_finish_chatgpt_login();
-#if defined(MACOS_ENABLED)
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 		if (auth_mode) {
 			auth_mode->select(1);
 		}
@@ -1802,10 +1803,11 @@ AgentWorkspace::AgentWorkspace() {
 	};
 	add_field("API Key", &api_key);
 	api_key->set_secret(true);
-#if defined(MACOS_ENABLED)
-	// ChatGPT 认证入口只在 macOS 构建中出现：Codex app-server 的 ChatGPT 登录能力仅随
-	// macOS sidecar 提供，Windows/Linux 继续只使用 API Key。即便在 macOS，也要等
-	// sidecar /v1/configure 返回 chatgpt_supported=true 且 codex_version 非空才启用。
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
+	// ChatGPT 认证入口在 macOS arm64 与 Windows x86_64 构建中出现：Codex app-server 的
+	// ChatGPT 登录能力随这两个平台的 sidecar 提供，Linux/其他平台继续只使用 API Key。
+	// 即便在这两个平台，也要等 sidecar /v1/configure 返回 chatgpt_supported=true 且
+	// codex_version 非空才启用。
 	Label *auth_mode_label = memnew(Label(_u8("认证模式")));
 	settings_grid->add_child(auth_mode_label);
 	auth_mode = memnew(OptionButton);
@@ -1836,7 +1838,7 @@ AgentWorkspace::AgentWorkspace() {
 	String saved_language = EDITOR_DEF("vibe_agent/response_language", "zh-CN");
 	response_language->select(saved_language == "en" ? 1 : saved_language == "auto" ? 2 : 0);
 	settings_grid->add_child(response_language);
-#if defined(MACOS_ENABLED)
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 	// 状态区只展示账号 label/email/plan_enabled 等 metadata，不展示任何 token 或授权 URL。
 	chatgpt_section = memnew(VBoxContainer);
 	chatgpt_section->set_h_size_flags(SIZE_EXPAND_FILL);
