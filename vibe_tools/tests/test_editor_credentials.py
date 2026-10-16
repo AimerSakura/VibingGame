@@ -177,5 +177,109 @@ class MacOSCredentialTest(unittest.TestCase):
             ec.credential("api_key")
 
 
+class SecretNameTest(unittest.TestCase):
+    def test_accepts_supported_names(self):
+        for name in ("api_key", "codex_host_id", "codex/AbC123_-xyz"):
+            with patch.object(ec, "_macos_credential", return_value="v"), \
+                 patch.object(ec.sys, "platform", "darwin"):
+                self.assertEqual(ec.secret(name), "v")
+
+    def test_rejects_unknown_name(self):
+        for bad in ("oauth_refresh_token", "codex/", "codex/../x", "api_key/../x",
+                    "codex/short", "codex/" + "a" * 65, "codex/空格名字占位"):
+            with self.assertRaises(ValueError):
+                ec.secret(bad)
+
+    def test_delete_routes_to_backend(self):
+        with patch.object(ec, "_macos_delete", return_value=None) as dele, \
+             patch.object(ec.sys, "platform", "darwin"):
+            ec.delete_secret("codex/AbC123_-xyz")
+            dele.assert_called_once_with("codex/AbC123_-xyz")
+
+    def test_delete_rejects_unknown_name(self):
+        with self.assertRaises(ValueError):
+            ec.delete_secret("codex/../x")
+
+    def test_delete_propagates_credential_error(self):
+        with patch.object(ec, "_macos_delete", side_effect=ec.CredentialError("-25300")):
+            with self.assertRaises(ec.CredentialError):
+                ec.delete_secret("codex/AbC123_-xyz")
+
+    def test_credential_still_restricted_to_api_key(self):
+        with patch.object(ec, "_macos_credential", return_value="v"), \
+             patch.object(ec.sys, "platform", "darwin"):
+            with self.assertRaises(ValueError):
+                ec.credential("codex_host_id")
+
+    def test_secret_unsupported_platform_raises(self):
+        with patch.object(ec.os, "name", "posix"), patch.object(ec.sys, "platform", "linux"):
+            with self.assertRaises(ec.CredentialError):
+                ec.secret("codex_host_id")
+            with self.assertRaises(ec.CredentialError):
+                ec.delete_secret("codex_host_id")
+
+
+class WindowsDeleteTest(unittest.TestCase):
+    def test_delete_routes_not_found_is_ok(self):
+        api = MagicMock()
+        api.CredDeleteW.return_value = 0
+        with patch.object(ec, "_load_windows_api", return_value=api), \
+             patch.object(ec, "_windows_last_error", return_value=1168), \
+             patch.object(ec.os, "name", "nt"):
+            ec.delete_secret("codex/AbC123_-xyz")
+        api.CredDeleteW.assert_called_once_with("Godot/VibeAgent/codex/AbC123_-xyz", 1, 0)
+
+    def test_delete_failure_raises_without_secret(self):
+        api = MagicMock()
+        api.CredDeleteW.return_value = 0
+        with patch.object(ec, "_load_windows_api", return_value=api), \
+             patch.object(ec, "_windows_last_error", return_value=5), \
+             patch.object(ec, "_windows_error", return_value=OSError("拒绝访问")), \
+             patch.object(ec.os, "name", "nt"):
+            with self.assertRaises(OSError):
+                ec.delete_secret("codex/AbC123_-xyz")
+
+
+class MacOSDeleteTest(unittest.TestCase):
+    def setUp(self):
+        self.security = MagicMock()
+        self.corefoundation = MagicMock()
+        self.patches = [
+            patch.object(ec.sys, "platform", "darwin"),
+            patch.object(ec.os, "name", "posix"),
+            patch.object(ec, "_load_macos_security", return_value=self.security),
+            patch.object(ec, "_load_macos_corefoundation", return_value=self.corefoundation),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self):
+        for item in reversed(self.patches):
+            item.stop()
+
+    def test_not_found_is_idempotent(self):
+        self.security.SecKeychainFindGenericPassword.return_value = ec.ERR_SEC_ITEM_NOT_FOUND
+        ec.delete_secret("codex/AbC123_-xyz")
+        self.security.SecKeychainItemDelete.assert_not_called()
+
+    def test_delete_calls_delete_and_releases(self):
+        def fake_find(keychain, slen, service, alen, account, plen, pdata, out):
+            out._obj.value = 0x4321
+            return ec.ERR_SEC_SUCCESS
+
+        self.security.SecKeychainFindGenericPassword.side_effect = fake_find
+        self.security.SecKeychainItemDelete.return_value = ec.ERR_SEC_SUCCESS
+        ec.delete_secret("codex/AbC123_-xyz")
+        self.security.SecKeychainItemDelete.assert_called_once()
+        self.corefoundation.CFRelease.assert_called_once()
+
+    def test_delete_failure_raises_without_secret(self):
+        self.security.SecKeychainFindGenericPassword.return_value = ec.ERR_SEC_SUCCESS
+        self.security.SecKeychainItemDelete.return_value = -25308
+        with self.assertRaises(ec.CredentialError) as ctx:
+            ec.delete_secret("codex/AbC123_-xyz")
+        self.assertIn("-25308", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
