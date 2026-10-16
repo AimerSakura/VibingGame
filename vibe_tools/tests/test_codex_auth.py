@@ -3,12 +3,14 @@ from __future__ import annotations
 import base64
 import io
 import json
+import ssl
 import time
+import types
 import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
@@ -88,6 +90,22 @@ class _TrackingBytesIO(io.BytesIO):
     def read(self, size: int = -1) -> bytes:
         self.read_sizes.append(size)
         return super().read(size)
+
+
+class _FakeHttpResponse:
+    """Minimal urlopen stand-in that lets tests observe the TLS context."""
+
+    def __init__(self, body: bytes = b"{}") -> None:
+        self._body = body
+
+    def read(self, size: int = -1) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
 
 
 def _http_error(code: int, body: bytes = b"") -> urllib.error.HTTPError:
@@ -599,6 +617,66 @@ class DiscoverTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(getter.call_count, 1)
         ca._DISCOVERY_CACHE = None
+
+
+class _ContextCapture:
+    """Records the SSL context passed to a patched ``urlopen``."""
+
+    def __init__(self, body: bytes = b"{}") -> None:
+        self.context = None
+        self.response = _FakeHttpResponse(body)
+
+    def __call__(self, request, timeout=None, context=None):
+        self.context = context
+        return self.response
+
+
+class TlsContextTest(unittest.TestCase):
+    """The packaged app has no system trust store, so auth HTTPS must use certifi."""
+
+    def test_ssl_context_loads_certifi_bundle(self):
+        fake_context = MagicMock()
+        fake_certifi = types.SimpleNamespace(where=lambda: "/sentinel/cacert.pem")
+        with patch.object(ca, "certifi", fake_certifi), \
+             patch.object(ca.ssl, "create_default_context", return_value=fake_context):
+            context = ca.ssl_context()
+        self.assertIs(context, fake_context)
+        fake_context.load_verify_locations.assert_called_once_with(cafile="/sentinel/cacert.pem")
+
+    def test_ssl_context_falls_back_when_certifi_unavailable(self):
+        fake_context = MagicMock()
+        with patch.object(ca, "certifi", None), \
+             patch.object(ca.ssl, "create_default_context", return_value=fake_context) as create:
+            context = ca.ssl_context()
+        self.assertIs(context, fake_context)
+        create.assert_called_once_with()
+        fake_context.load_verify_locations.assert_not_called()
+
+    def test_ssl_context_keeps_default_when_bundle_unreadable(self):
+        fake_context = MagicMock()
+        fake_context.load_verify_locations.side_effect = OSError("unreadable bundle")
+        fake_certifi = types.SimpleNamespace(where=lambda: "/missing/cacert.pem")
+        with patch.object(ca, "certifi", fake_certifi), \
+             patch.object(ca.ssl, "create_default_context", return_value=fake_context):
+            context = ca.ssl_context()
+        self.assertIs(context, fake_context)
+
+    def _assert_verifying_context(self, context):
+        self.assertIsInstance(context, ssl.SSLContext)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_token_post_passes_verifying_ssl_context(self):
+        capture = _ContextCapture()
+        with patch.object(urllib.request, "urlopen", side_effect=capture):
+            ca._post_form(ca.TOKEN_ENDPOINT, {"a": "b"})
+        self._assert_verifying_context(capture.context)
+
+    def test_discovery_get_passes_verifying_ssl_context(self):
+        capture = _ContextCapture(body=json.dumps({"jwks_uri": "https://x/jwks"}).encode("utf-8"))
+        with patch.object(urllib.request, "urlopen", side_effect=capture):
+            ca._get_json(ca.DISCOVERY_URL)
+        self._assert_verifying_context(capture.context)
 
 
 if __name__ == "__main__":

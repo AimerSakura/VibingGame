@@ -12,6 +12,7 @@ import logging
 import queue
 import re
 import secrets
+import ssl
 import threading
 import time
 import urllib.error
@@ -33,6 +34,11 @@ try:  # ``cryptography`` 是唯一新增运行时依赖；缺失时仅验签路�
     _CRYPTO_AVAILABLE = True
 except ImportError:  # pragma: no cover - 正常安装环境始终可用
     _CRYPTO_AVAILABLE = False
+
+try:  # certifi 随包提供 CA bundle；打包环境找不到系统证书库时使用它。
+    import certifi
+except ImportError:  # pragma: no cover - 回退到系统默认证书库
+    certifi = None  # type: ignore[assignment]
 
 AUTHORIZE_ENDPOINT = "https://auth.openai.com/api/accounts/authorize"
 TOKEN_ENDPOINT = "https://auth.openai.com/api/accounts/oauth/token"
@@ -170,6 +176,25 @@ def _http_error_oauth_code(exc: urllib.error.HTTPError) -> str | None:
     return _safe_oauth_error_code(payload)
 
 
+def ssl_context() -> ssl.SSLContext:
+    """Return a verifying TLS context using the bundled certifi CA bundle.
+
+    打包后的解释器可能找不到系统证书库，因此所有 OpenAI auth 的 HTTPS 请求都
+    显式使用随包的 certifi CA。certifi 不可用时回退到解释器的安全系统默认
+    context；任何情况下都不关闭证书或主机名校验。
+    """
+    context = ssl.create_default_context()
+    if certifi is not None:
+        try:
+            bundle = certifi.where()
+            if bundle:
+                context.load_verify_locations(cafile=bundle)
+        except Exception:
+            # certifi 或它的 CA 文件不可用时保留系统默认信任库，校验仍然开启。
+            pass
+    return context
+
+
 def _post_form(url: str, data: dict[str, str]) -> dict[str, Any]:
     body = urllib.parse.urlencode(data).encode("ascii")
     request = urllib.request.Request(
@@ -182,7 +207,9 @@ def _post_form(url: str, data: dict[str, str]) -> dict[str, Any]:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+        with urllib.request.urlopen(
+            request, timeout=HTTP_TIMEOUT_S, context=ssl_context()
+        ) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
         raise _HttpError(
@@ -202,7 +229,9 @@ def _post_form(url: str, data: dict[str, str]) -> dict[str, Any]:
 def _get_json(url: str) -> dict[str, Any]:
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
+        with urllib.request.urlopen(
+            request, timeout=HTTP_TIMEOUT_S, context=ssl_context()
+        ) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
         raise CodexAuthError("discovery_failed_%d" % int(exc.code)) from None

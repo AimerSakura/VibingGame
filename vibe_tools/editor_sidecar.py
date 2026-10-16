@@ -907,7 +907,9 @@ def _resolve_jwks(metadata: Any) -> dict[str, Any]:
         raise codex_auth.CodexAuthError("discovery_failed")
     request = urllib.request.Request(jwks_uri, headers={"Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(
+            request, timeout=30, context=codex_auth.ssl_context()
+        ) as response:
             # Bound the read so an oversized or endless body cannot exhaust memory.
             raw = response.read(_MAX_JWKS_BYTES + 1)
     except Exception:

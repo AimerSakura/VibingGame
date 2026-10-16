@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -299,6 +300,22 @@ class JwksResolutionTest(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "discovery_failed")
         self.assertNotIn(secret, str(ctx.exception))
         self.assertNotIn("secret.example.com", str(ctx.exception))
+
+    def test_https_jwks_fetch_uses_verifying_ssl_context(self):
+        body = json.dumps({"keys": [{"kty": "RSA"}]}).encode("utf-8")
+        captured = {}
+
+        def fake_urlopen(request, timeout=None, context=None):
+            captured["context"] = context
+            return _FakeJwksResponse(body)
+
+        with patch.object(sidecar_module.urllib.request, "urlopen", side_effect=fake_urlopen):
+            result = sidecar_module._resolve_jwks({"jwks_uri": "https://example.com/jwks"})
+        self.assertEqual(result, {"keys": [{"kty": "RSA"}]})
+        context = captured["context"]
+        self.assertIsInstance(context, ssl.SSLContext)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
 
 
 class ChatGptAuthTest(unittest.TestCase):
