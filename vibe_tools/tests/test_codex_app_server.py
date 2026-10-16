@@ -1,0 +1,421 @@
+"""Tests for the Codex app-server stdio/JSONL client.
+
+These tests drive an offline fake app-server (``tests/fixtures/fake_codex_app_server.py``)
+so no real ``codex`` binary or ChatGPT token is required.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from vibe_tools.codex_app_server import (
+    APP_SERVER_CONFIG,
+    CodexAppServer,
+    CodexAppServerError,
+    TurnEvent,
+)
+
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "fake_codex_app_server.py"
+FAKE_TOKEN = "AT-FAKE-TOKEN-0123456789"
+FAKE_MODEL = "gpt-5.1-codex"
+
+
+def _launcher(fixture: Path, workdir: str) -> str:
+    """Return an executable that runs the fixture on every platform."""
+    if os.name == "nt":  # pragma: no cover - exercised on Windows only
+        wrapper = Path(workdir) / "fake_codex.cmd"
+        wrapper.write_text(
+            '@echo off\r\n"{}" "{}" %*\r\n'.format(sys.executable, fixture),
+            encoding="utf-8",
+        )
+        return str(wrapper)
+    os.chmod(fixture, 0o755)
+    return str(fixture)
+
+
+class _ServerTestCase(unittest.TestCase):
+    scenario = "happy"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.transcript = Path(self.temp.name) / "transcript.jsonl"
+        self.logs: list[str] = []
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _server(self, scenario: str | None = None, timeout: float = 5.0) -> CodexAppServer:
+        env = dict(os.environ)
+        env["FAKE_CODEX_SCENARIO"] = scenario or self.scenario
+        env["FAKE_CODEX_TRANSCRIPT"] = str(self.transcript)
+        return CodexAppServer(
+            codex_exe=_launcher(FIXTURE, self.temp.name),
+            cwd=self.temp.name,
+            access_token=FAKE_TOKEN,
+            model=FAKE_MODEL,
+            env=env,
+            log=self.logs.append,
+            request_timeout=timeout,
+        )
+
+    def _records(self) -> list[dict]:
+        if not self.transcript.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in self.transcript.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def _received(self) -> list[dict]:
+        return [record["msg"] for record in self._records() if record.get("event") == "recv"]
+
+    def _methods(self) -> list[str]:
+        return [message.get("method") for message in self._received()]
+
+    def _wait_for_received(self, method: str, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if method in self._methods():
+                return
+            time.sleep(0.01)
+        self.fail(f"timed out waiting for {method!r} in fake transcript")
+
+    def _assert_no_token(self) -> None:
+        joined = "\n".join(self.logs)
+        self.assertNotIn(FAKE_TOKEN, joined)
+        if self.transcript.exists():
+            self.assertNotIn(FAKE_TOKEN, self.transcript.read_text(encoding="utf-8"))
+
+
+class InjectionTest(_ServerTestCase):
+    def test_argv_is_fixed_config_only(self):
+        server = self._server()
+        server.start()
+        try:
+            argv = server._argv
+            self.assertEqual(argv[1:4], ["app-server", "--listen", "stdio://"])
+            rest = argv[4:]
+            self.assertEqual(len(rest), len(APP_SERVER_CONFIG) * 2)
+            self.assertEqual(rest[0::2], ["-c"] * len(APP_SERVER_CONFIG))
+            configs = rest[1::2]
+            self.assertEqual(tuple(configs), APP_SERVER_CONFIG)
+            for expected in (
+                'model_provider="openai_chatgpt_plan"',
+                'model_providers.openai_chatgpt_plan.env_key="ACCESS_TOKEN"',
+                'model_providers.openai_chatgpt_plan.requires_openai_auth=false',
+                'model_providers.openai_chatgpt_plan.supports_websockets=false',
+            ):
+                self.assertIn(expected, configs)
+            joined = " ".join(argv)
+            self.assertNotIn(FAKE_TOKEN, joined)
+            self.assertNotIn(FAKE_MODEL, joined)
+            self.assertNotIn(self.temp.name, joined)
+        finally:
+            server.stop()
+
+    def test_access_token_only_in_child_env(self):
+        before = os.environ.get("ACCESS_TOKEN")
+        server = self._server()
+        server.start()
+        try:
+            self.assertEqual(os.environ.get("ACCESS_TOKEN"), before)
+            self.assertNotEqual(os.environ.get("ACCESS_TOKEN"), FAKE_TOKEN)
+            self.assertIn("ACCESS_TOKEN", server._child_env)
+            self.assertEqual(server._child_env["ACCESS_TOKEN"], FAKE_TOKEN)
+            self.assertNotIn(FAKE_TOKEN, " ".join(server._argv))
+            self.assertNotIn(FAKE_TOKEN, "\n".join(self.logs))
+        finally:
+            server.stop()
+
+        self._assert_no_token()
+        start = self._records()[0]
+        self.assertEqual(start["event"], "start")
+        self.assertTrue(start["access_token_present"])
+        self.assertEqual(start["argv"], server._argv[1:])
+
+    def test_injected_env_is_the_base_copy(self):
+        server = self._server()
+        server.start()
+        try:
+            self.assertEqual(server._child_env["FAKE_CODEX_SCENARIO"], "happy")
+            self.assertEqual(server._child_env["FAKE_CODEX_TRANSCRIPT"], str(self.transcript))
+        finally:
+            server.stop()
+
+
+class InitializeTest(_ServerTestCase):
+    def test_initialize_order_and_client_info(self):
+        server = self._server()
+        server.start()
+        try:
+            methods = self._methods()
+            self.assertEqual(methods[0], "initialize")
+            self._wait_for_received("initialized")
+            methods = self._methods()
+            self.assertEqual(methods[1], "initialized")
+            server.start_thread()
+            methods = self._methods()
+            self.assertLess(methods.index("initialize"), methods.index("initialized"))
+            self.assertLess(methods.index("initialized"), methods.index("thread/start"))
+            initialize = self._received()[0]
+            self.assertEqual(initialize["params"]["clientInfo"]["name"], "VibeGodot")
+            self.assertEqual(initialize["params"]["clientInfo"]["title"], "VibeGodot")
+        finally:
+            server.stop()
+
+    def test_initialize_timeout_raises(self):
+        server = self._server("no_initialize_response", timeout=0.3)
+        with self.assertRaises(CodexAppServerError):
+            server.start()
+        self.assertFalse(server.alive())
+        self.assertNotIn(FAKE_TOKEN, "\n".join(self.logs))
+        server.stop()
+
+    def test_initialize_error_response_raises(self):
+        server = self._server("initialize_error", timeout=2.0)
+        with self.assertRaises(CodexAppServerError) as context:
+            server.start()
+        self.assertIn("initialize", str(context.exception))
+        self.assertNotIn(FAKE_TOKEN, str(context.exception))
+        server.stop()
+
+    def test_initialize_malformed_response_raises(self):
+        server = self._server("initialize_empty", timeout=2.0)
+        with self.assertRaises(CodexAppServerError):
+            server.start()
+        server.stop()
+
+    def test_token_never_in_exception(self):
+        server = self._server("no_initialize_response", timeout=0.3)
+        try:
+            server.start()
+        except CodexAppServerError as exc:
+            self.assertNotIn(FAKE_TOKEN, str(exc))
+        else:  # pragma: no cover - start must fail
+            self.fail("expected CodexAppServerError")
+        server.stop()
+
+
+class ThreadTest(_ServerTestCase):
+    def test_start_and_resume_thread(self):
+        server = self._server()
+        server.start()
+        try:
+            self.assertEqual(server.start_thread(), "thread-fake-1")
+            self.assertEqual(server.resume_thread("thread-existing"), "thread-existing")
+            methods = self._methods()
+            self.assertIn("thread/start", methods)
+            self.assertIn("thread/resume", methods)
+        finally:
+            server.stop()
+
+    def test_flat_thread_id_shape(self):
+        server = self._server("flat_thread_id")
+        server.start()
+        try:
+            self.assertEqual(server.start_thread(), "thread-flat")
+        finally:
+            server.stop()
+
+
+class TurnTest(_ServerTestCase):
+    def test_event_mapping_and_delta_concatenation(self):
+        server = self._server()
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            events = list(server.run_turn(thread_id, "hello sensitive prompt"))
+            self.assertEqual(
+                [event.kind for event in events],
+                ["agent_delta", "agent_delta", "command_output", "file_change", "turn_completed"],
+            )
+            self.assertEqual(
+                "".join(event.text for event in events if event.kind == "agent_delta"),
+                "Hello world",
+            )
+            self.assertEqual(events[0].item_id, "msg-1")
+            self.assertEqual(events[2].text, "out\n")
+            self.assertEqual(events[3].text, "res://main.gd")
+            self.assertNotIn("SECRET-FILE-CONTENT", events[3].text)
+            self.assertEqual(events[-1].status, "completed")
+            self.assertNotIn("SECRET-FILE-CONTENT", "\n".join(self.logs))
+            self.assertNotIn("hello sensitive prompt", "\n".join(self.logs))
+        finally:
+            server.stop()
+
+    def test_bad_json_lines_are_skipped(self):
+        server = self._server("bad_json")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            events = list(server.run_turn(thread_id, "go"))
+            self.assertEqual(events[-1].kind, "turn_completed")
+            self.assertEqual(events[-1].status, "completed")
+            self.assertEqual(
+                "".join(event.text for event in events if event.kind == "agent_delta"),
+                "Hello world",
+            )
+        finally:
+            server.stop()
+
+    def test_failed_turn_maps_to_error(self):
+        server = self._server("failed_turn")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            events = list(server.run_turn(thread_id, "go"))
+            self.assertEqual(events[-1].kind, "error")
+            self.assertEqual(events[-1].status, "failed")
+            self.assertIn("model exploded", events[-1].message or "")
+            self.assertNotIn(FAKE_TOKEN, events[-1].message or "")
+        finally:
+            server.stop()
+
+    def test_error_notification_maps_to_error(self):
+        server = self._server("error_notification")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            events = list(server.run_turn(thread_id, "go"))
+            self.assertEqual(events[-1].kind, "error")
+            self.assertIn("stream blew up", events[-1].message or "")
+        finally:
+            server.stop()
+
+    def test_notifications_without_thread_id_do_not_hang(self):
+        server = self._server("missing_thread_id")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            events = list(server.run_turn(thread_id, "go"))
+            self.assertEqual([event.kind for event in events], ["agent_delta", "turn_completed"])
+            self.assertEqual(events[0].text, "loose")
+            self.assertEqual(events[-1].status, "completed")
+        finally:
+            server.stop()
+
+    def test_concurrent_turn_for_same_thread_rejected(self):
+        server = self._server("interrupt_wait")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            generator = server.run_turn(thread_id, "go")
+            first = next(generator)
+            self.assertEqual(first.kind, "agent_delta")
+            with self.assertRaises(CodexAppServerError):
+                second = server.run_turn(thread_id, "again")
+                next(second)
+            server.interrupt(thread_id, "turn-fake-1")
+            list(generator)
+        finally:
+            server.stop()
+
+
+class InterruptTest(_ServerTestCase):
+    def test_interrupt_sends_turn_interrupt(self):
+        server = self._server("interrupt_wait")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            generator = server.run_turn(thread_id, "go")
+            first = next(generator)
+            self.assertEqual(first.text, "partial")
+            server.interrupt(thread_id, "turn-fake-1")
+            events = list(generator)
+            self.assertEqual(events[-1].kind, "turn_completed")
+            self.assertEqual(events[-1].status, "interrupted")
+            interrupts = [
+                message
+                for message in self._received()
+                if message.get("method") == "turn/interrupt"
+            ]
+            self.assertEqual(len(interrupts), 1)
+            self.assertEqual(interrupts[0]["params"]["threadId"], thread_id)
+            self.assertEqual(interrupts[0]["params"]["turnId"], "turn-fake-1")
+        finally:
+            server.stop()
+
+
+class ApprovalTest(_ServerTestCase):
+    def test_server_request_is_declined(self):
+        server = self._server("approval")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            events = list(server.run_turn(thread_id, "run the command"))
+            self.assertEqual(events[-1].kind, "turn_completed")
+            decisions = [
+                record for record in self._records() if record.get("event") == "approval_decision"
+            ]
+            self.assertEqual(len(decisions), 1)
+            self.assertEqual(decisions[0]["decision"], "decline")
+            decline = [
+                message
+                for message in self._received()
+                if message.get("id") == 9001 and "method" not in message
+            ]
+            self.assertEqual(len(decline), 1)
+            self.assertEqual(decline[0]["result"], {"decision": "decline"})
+            self._assert_no_token()
+        finally:
+            server.stop()
+
+
+class LifecycleTest(_ServerTestCase):
+    def test_stop_is_idempotent_and_alive_reflects_process(self):
+        server = self._server()
+        server.start()
+        self.assertTrue(server.alive())
+        server.stop()
+        self.assertFalse(server.alive())
+        server.stop()
+        self.assertFalse(server.alive())
+
+    def test_exit_during_turn_raises(self):
+        server = self._server("exit_during_turn")
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            with self.assertRaises(CodexAppServerError):
+                list(server.run_turn(thread_id, "go"))
+            deadline = time.time() + 5.0
+            while server.alive() and time.time() < deadline:
+                time.sleep(0.02)
+            self.assertFalse(server.alive())
+        finally:
+            server.stop()
+        server.stop()
+
+    def test_exit_immediately_start_fails(self):
+        server = self._server("exit_immediately", timeout=2.0)
+        with self.assertRaises(CodexAppServerError):
+            server.start()
+        self.assertFalse(server.alive())
+        server.stop()
+
+    def test_request_after_stop_raises(self):
+        server = self._server()
+        server.start()
+        server.stop()
+        with self.assertRaises(CodexAppServerError):
+            server.start_thread()
+
+
+class TurnEventTest(unittest.TestCase):
+    def test_defaults(self):
+        event = TurnEvent("agent_delta")
+        self.assertEqual(event.text, "")
+        self.assertIsNone(event.item_id)
+        self.assertIsNone(event.status)
+        self.assertIsNone(event.message)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
