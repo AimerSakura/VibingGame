@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -18,6 +23,18 @@ from vibe_tools.editor_workspace import Workspace
 from vibe_tools.tests.test_editor_behavior import move_case
 
 
+def _reset_auth_state() -> None:
+    Runtime.auth_mode = "api_key"
+    Runtime.auth_attempts = {}
+    Runtime.chatgpt_account_id = None
+    Runtime.chatgpt_account = None
+    Runtime.app_server_status = "stopped"
+    Runtime.app_server_account_id = None
+    Runtime.codex_probed = True
+    Runtime.codex_exe = ""
+    Runtime.codex_version = ""
+
+
 class EditorSidecarTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -29,19 +46,26 @@ class EditorSidecarTest(unittest.TestCase):
         Runtime.parent_pid = 123
         Runtime.godot_exe = ""
         Runtime.runs = {}
+        _reset_auth_state()
         self.client = TestClient(app)
         self.headers = {"Authorization": "Bearer sidecar-token"}
         self.credentials = patch("vibe_tools.editor_sidecar.credential", return_value="")
         self.credentials.start()
         self.backend = patch.object(sidecar_module, "credential_backend", return_value="macos")
         self.backend.start()
+        self.state_dir = patch.dict(
+            os.environ, {"VIBEGODOT_CODEX_STATE_DIR": str(Path(self.temp.name) / "codex-state"),
+                         "GODOT_EXE": os.environ.get("GODOT_EXE") or sys.executable})
+        self.state_dir.start()
         self.preflight = patch.object(AcceptanceHarness, "_preflight", return_value={"status": "blocked", "summary": "Godot unavailable in unit test"})
         self.preflight.start()
 
     def tearDown(self):
         self.preflight.stop()
+        self.state_dir.stop()
         self.backend.stop()
         self.credentials.stop()
+        _reset_auth_state()
         self.temp.cleanup()
 
     def test_project_bound_health_and_authentication(self):
@@ -192,6 +216,408 @@ class EditorSidecarTest(unittest.TestCase):
         finally:
             Runtime.run_lock.release()
         self.assertEqual(response.status_code, 409)
+
+
+class _FakeLoopback:
+    """Offline stand-in for ``codex_auth.LoopbackCallback``."""
+
+    def __init__(self, query=None):
+        self.query = query or {}
+        self.redirect_uri = "http://127.0.0.1:4321/auth/callback"
+        self.closed = False
+        self.started = False
+
+    def start(self):
+        self.started = True
+        return self.redirect_uri
+
+    def wait(self, timeout_s=300):
+        return dict(self.query)
+
+    def close(self):
+        self.closed = True
+
+
+class ChatGptAuthTest(unittest.TestCase):
+    """Offline, non-privileged tests for the SIWC auth state and endpoints."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.project = Path(self.temp.name) / "project"
+        self.project.mkdir()
+        (self.project / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+        Runtime.project = self.project.resolve()
+        Runtime.token = "sidecar-token"
+        Runtime.parent_pid = 123
+        Runtime.godot_exe = ""
+        Runtime.runs = {}
+        _reset_auth_state()
+        self.client = TestClient(app)
+        self.headers = {"Authorization": "Bearer sidecar-token"}
+        self.credentials = patch.object(sidecar_module, "credential", return_value="")
+        self.credentials.start()
+        self.backend = patch.object(sidecar_module, "credential_backend", return_value="macos")
+        self.backend.start()
+        self.state_dir = patch.dict(
+            os.environ, {"VIBEGODOT_CODEX_STATE_DIR": str(Path(self.temp.name) / "codex-state")})
+        self.state_dir.start()
+
+    def tearDown(self):
+        self.state_dir.stop()
+        self.backend.stop()
+        self.credentials.stop()
+        _reset_auth_state()
+        self.temp.cleanup()
+
+    # -- helpers ---------------------------------------------------------- #
+
+    def _enable_chatgpt(self):
+        Runtime.codex_probed = True
+        Runtime.codex_exe = "/opt/codex"
+        Runtime.codex_version = "1.2.3"
+
+    def _attempt(self, login_id):
+        return {
+            "id": login_id, "status": "authorizing", "error": None, "account": None,
+            "loopback": None, "state": "", "nonce": "", "verifier": "",
+            "cancel": threading.Event(), "created": time.time(), "thread": None,
+        }
+
+    @contextlib.contextmanager
+    def _login_success_stack(self, saved, *, loopback=None, exchange=None, claims=None):
+        fake = loopback or _FakeLoopback(
+            {"code": "CODE", "state": "STATE", "client_id": "oaiapp_issued", "scope": ""})
+        token_response = exchange or {
+            "id_token": "IDT", "access_token": "AT", "refresh_token": "RT",
+            "token_type": "Bearer", "expires_in": 3600,
+            "scope": "openid profile email chatgpt.tokens.use.direct",
+        }
+        claims = claims or {
+            "iss": "https://auth.openai.com", "sub": "sub-1",
+            "email": "user@example.com", "name": "User", "nonce": "N",
+        }
+
+        def fake_save(account):
+            saved["account"] = account
+
+        def fake_set_active(account_id):
+            saved["active"] = account_id
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(sidecar_module.codex_auth, "host_id", return_value="urn:uuid:host"))
+            stack.enter_context(patch.object(sidecar_module.codex_auth, "new_pkce", return_value=("verifier", "challenge")))
+            stack.enter_context(patch.object(
+                sidecar_module.codex_auth, "build_authorize_url",
+                return_value="https://auth.openai.com/api/accounts/authorize"))
+            stack.enter_context(patch.object(sidecar_module.codex_auth, "LoopbackCallback", return_value=fake))
+            stack.enter_context(patch.object(
+                sidecar_module.codex_auth, "validate_callback",
+                return_value={"code": "CODE", "state": "STATE", "client_id": "oaiapp_issued", "scope": ""}))
+            stack.enter_context(patch.object(sidecar_module.codex_auth, "exchange_code", return_value=token_response))
+            stack.enter_context(patch.object(
+                sidecar_module.codex_auth, "discover", return_value={"keys": [{"kty": "RSA"}]}))
+            stack.enter_context(patch.object(sidecar_module.codex_auth, "validate_id_token", return_value=claims))
+            stack.enter_context(patch.object(sidecar_module.codex_auth, "plan_enabled", return_value=True))
+            stack.enter_context(patch.object(sidecar_module.codex_accounts, "save_account", side_effect=fake_save))
+            stack.enter_context(patch.object(sidecar_module.codex_accounts, "set_active_account", side_effect=fake_set_active))
+            browser = stack.enter_context(patch.object(sidecar_module.webbrowser, "open"))
+            yield fake, browser
+
+    @contextlib.contextmanager
+    def _login_error_stack(self, raw_error):
+        fake = _FakeLoopback({"code": "CODE", "state": "STATE", "client_id": "oaiapp_issued"})
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(sidecar_module.codex_auth, "host_id", return_value="urn:uuid:host"))
+            stack.enter_context(patch.object(sidecar_module.codex_auth, "new_pkce", return_value=("verifier", "challenge")))
+            stack.enter_context(patch.object(
+                sidecar_module.codex_auth, "build_authorize_url",
+                return_value="https://auth.openai.com/api/accounts/authorize"))
+            stack.enter_context(patch.object(sidecar_module.codex_auth, "LoopbackCallback", return_value=fake))
+            stack.enter_context(patch.object(
+                sidecar_module.codex_auth, "validate_callback",
+                return_value={"code": "CODE", "state": "STATE", "client_id": "oaiapp_issued", "scope": ""}))
+            stack.enter_context(patch.object(
+                sidecar_module.codex_auth, "exchange_code",
+                side_effect=sidecar_module.codex_auth.CodexAuthError(raw_error)))
+            stack.enter_context(patch.object(sidecar_module.codex_accounts, "save_account"))
+            stack.enter_context(patch.object(sidecar_module.webbrowser, "open"))
+            yield fake
+
+    # -- configure / capability ------------------------------------------ #
+
+    def test_configure_defaults_to_api_key_without_codex(self):
+        body = self.client.get("/v1/configure", headers=self.headers).json()
+        self.assertEqual(body["auth_mode"], "api_key")
+        self.assertFalse(body["chatgpt_supported"])
+        self.assertIsNone(body["chatgpt_account"])
+        self.assertEqual(body["codex_version"], "")
+        self.assertEqual(body["protocol_version"], 1)
+        self.assertEqual(body["credential_store"], "macos")
+
+    def test_configure_chatgpt_unsupported_returns_409(self):
+        response = self.client.post("/v1/configure", headers=self.headers, json={"auth_mode": "chatgpt"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.client.get("/v1/configure", headers=self.headers).json()["auth_mode"], "api_key")
+
+    def test_configure_chatgpt_supported_updates_mode(self):
+        self._enable_chatgpt()
+        with patch.object(sidecar_module.sys, "platform", "darwin"):
+            response = self.client.post("/v1/configure", headers=self.headers, json={"auth_mode": "chatgpt"})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["auth_mode"], "chatgpt")
+        self.assertTrue(body["chatgpt_supported"])
+        self.assertEqual(body["codex_version"], "1.2.3")
+        self.assertNotIn("auth_mode", Runtime.config)
+        self.assertNotIn("chatgpt_account_id", Runtime.config)
+
+    def test_non_macos_forces_api_key_and_rejects_chatgpt(self):
+        Runtime.codex_probed = False
+        Runtime.codex_exe = "/opt/codex"
+        with patch.object(sidecar_module.sys, "platform", "win32"):
+            body = self.client.get("/v1/configure", headers=self.headers).json()
+            self.assertEqual(body["auth_mode"], "api_key")
+            self.assertFalse(body["chatgpt_supported"])
+            self.assertEqual(body["codex_version"], "")
+            conflict = self.client.post("/v1/configure", headers=self.headers, json={"auth_mode": "chatgpt"})
+            self.assertEqual(conflict.status_code, 409)
+
+    def test_configure_stores_selected_account_id_without_tokens(self):
+        self._enable_chatgpt()
+        with patch.object(sidecar_module.sys, "platform", "darwin"), \
+             patch.object(sidecar_module.codex_accounts, "active_account_id", return_value=None), \
+             patch.object(sidecar_module.codex_accounts, "list_accounts", return_value=[]):
+            response = self.client.post(
+                "/v1/configure", headers=self.headers,
+                json={"auth_mode": "chatgpt", "chatgpt_account_id": "acct-9"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(Runtime.chatgpt_account_id, "acct-9")
+        self.assertNotIn("auth_mode", Runtime.config)
+        self.assertNotIn("chatgpt_account_id", Runtime.config)
+        self.assertNotIn("acct-9", json.dumps(Runtime.config))
+
+    def test_resolve_codex_exe_prefers_env_and_requires_executable(self):
+        exe = Path(self.temp.name) / "codex"
+        exe.write_text("#!/bin/sh\n", encoding="utf-8")
+        exe.chmod(0o755)
+        with patch.dict(os.environ, {"VIBE_CODEX_BIN": str(exe), "CODEX_BIN": ""}), \
+             patch.object(sidecar_module.shutil, "which", return_value="/path/from-path/codex"), \
+             patch.object(sidecar_module.os.path, "expanduser", return_value=str(self.temp.name)):
+            self.assertEqual(sidecar_module._resolve_codex_exe(), str(exe))
+
+    def test_resolve_codex_exe_rejects_non_executable(self):
+        exe = Path(self.temp.name) / "codex"
+        exe.write_text("data", encoding="utf-8")
+        exe.chmod(0o644)
+        with patch.dict(os.environ, {"VIBE_CODEX_BIN": str(exe), "CODEX_BIN": ""}), \
+             patch.object(sidecar_module.shutil, "which", return_value=None), \
+             patch.object(sidecar_module.os.path, "expanduser",
+                          return_value=str(Path(self.temp.name) / "missing-home")):
+            self.assertEqual(sidecar_module._resolve_codex_exe(), "")
+
+    def test_codex_version_returns_safe_string_only(self):
+        completed = subprocess.CompletedProcess([], 0, stdout=b"codex-cli 1.2.3\n", stderr=b"secret")
+        with patch.object(sidecar_module.subprocess, "run", return_value=completed):
+            self.assertEqual(sidecar_module._codex_version("/fake/codex"), "1.2.3")
+        with patch.object(sidecar_module.subprocess, "run", side_effect=OSError("boom")):
+            self.assertEqual(sidecar_module._codex_version("/fake/codex"), "")
+        with patch.object(sidecar_module.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"creds")
+            self.assertEqual(sidecar_module._codex_version("/fake/codex"), "")
+        self.assertEqual(sidecar_module._codex_version(""), "")
+
+    # -- authentication --------------------------------------------------- #
+
+    def test_new_endpoints_require_bearer_token(self):
+        cases = [
+            ("post", "/v1/auth/chatgpt/start", {}),
+            ("get", "/v1/auth/chatgpt/status?login_id=missing", None),
+            ("post", "/v1/auth/chatgpt/cancel", {"login_id": "missing"}),
+            ("post", "/v1/auth/chatgpt/logout", {"account_id": "missing"}),
+            ("get", "/v1/auth/chatgpt/accounts", None),
+        ]
+        for method, path, body in cases:
+            response = getattr(self.client, method)(path, json=body) if body is not None else getattr(self.client, method)(path)
+            self.assertEqual(response.status_code, 401, path)
+
+    def test_start_returns_only_login_id_and_authorizing(self):
+        self._enable_chatgpt()
+        with patch.object(sidecar_module, "_start_login_thread") as starter:
+            response = self.client.post("/v1/auth/chatgpt/start", headers=self.headers, json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(set(body.keys()), {"login_id", "status"})
+        self.assertEqual(body["status"], "authorizing")
+        lowered = response.text.lower()
+        for forbidden in ("http", "authorize", "code_challenge", "code_verifier", "access_token", "refresh_token"):
+            self.assertNotIn(forbidden, lowered)
+        starter.assert_called_once()
+        attempt = Runtime.auth_attempts[body["login_id"]]
+        self.assertEqual(attempt["status"], "authorizing")
+        self.assertEqual(attempt["state"], "")
+        self.assertEqual(attempt["verifier"], "")
+
+    def test_start_unsupported_returns_409(self):
+        response = self.client.post("/v1/auth/chatgpt/start", headers=self.headers, json={})
+        self.assertEqual(response.status_code, 409)
+
+    def test_start_allows_only_one_authorizing(self):
+        self._enable_chatgpt()
+        with patch.object(sidecar_module, "_start_login_thread"):
+            first = self.client.post("/v1/auth/chatgpt/start", headers=self.headers, json={})
+            second = self.client.post("/v1/auth/chatgpt/start", headers=self.headers, json={})
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual(second.status_code, 409)
+
+    def test_status_reports_pending_then_completed_metadata(self):
+        self._enable_chatgpt()
+        with patch.object(sidecar_module, "_start_login_thread"):
+            started = self.client.post("/v1/auth/chatgpt/start", headers=self.headers, json={}).json()
+        login_id = started["login_id"]
+        pending = self.client.get(
+            "/v1/auth/chatgpt/status", headers=self.headers, params={"login_id": login_id}).json()
+        self.assertEqual(pending["status"], "pending")
+        saved = {}
+        attempt = Runtime.auth_attempts[login_id]
+        with self._login_success_stack(saved) as (fake, browser):
+            sidecar_module._chatgpt_login_worker(attempt, None)
+        self.assertEqual(attempt["status"], "completed")
+        self.assertTrue(fake.closed)
+        browser.assert_called_once()
+        self.assertIn("authorize", browser.call_args.args[0])
+        completed = self.client.get(
+            "/v1/auth/chatgpt/status", headers=self.headers, params={"login_id": login_id}).json()
+        self.assertEqual(completed["status"], "completed")
+        account = completed["account"]
+        self.assertEqual(set(account.keys()), {"account_id", "label", "email", "plan_enabled"})
+        self.assertEqual(account["email"], "user@example.com")
+        self.assertTrue(account["plan_enabled"])
+        self.assertNotIn("AT", json.dumps(account))
+        self.assertEqual(saved["active"], account["account_id"])
+        self.assertEqual(Runtime.chatgpt_account_id, account["account_id"])
+        self.assertEqual(attempt["state"], "")
+        self.assertEqual(attempt["verifier"], "")
+        self.assertEqual(attempt["nonce"], "")
+
+    def test_status_reports_safe_failure_code(self):
+        login_id = "login-failure"
+        attempt = self._attempt(login_id)
+        Runtime.auth_attempts[login_id] = attempt
+        with self._login_error_stack("invalid_grant"):
+            sidecar_module._chatgpt_login_worker(attempt, None)
+        response = self.client.get(
+            "/v1/auth/chatgpt/status", headers=self.headers, params={"login_id": login_id}).json()
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["error"], "invalid_grant")
+        self.assertNotIn("CODE", json.dumps(response))
+        self.assertNotIn("verifier", json.dumps(response))
+
+    def test_status_maps_unsafe_error_to_generic_code(self):
+        login_id = "login-unsafe"
+        attempt = self._attempt(login_id)
+        Runtime.auth_attempts[login_id] = attempt
+        with self._login_error_stack("<script>alert(1)</script>"):
+            sidecar_module._chatgpt_login_worker(attempt, None)
+        response = self.client.get(
+            "/v1/auth/chatgpt/status", headers=self.headers, params={"login_id": login_id}).json()
+        self.assertEqual(response["status"], "failed")
+        self.assertEqual(response["error"], "auth_failed")
+        self.assertNotIn("<script>", json.dumps(response))
+
+    def test_status_unknown_login_id_is_404(self):
+        response = self.client.get(
+            "/v1/auth/chatgpt/status", headers=self.headers, params={"login_id": "nope"})
+        self.assertEqual(response.status_code, 404)
+
+    def test_cancel_closes_loopback_and_discards_secrets(self):
+        login_id = "login-cancel"
+        attempt = self._attempt(login_id)
+        fake = _FakeLoopback()
+        attempt.update({"loopback": fake, "state": "STATE", "nonce": "NONCE", "verifier": "VERIFIER"})
+        Runtime.auth_attempts[login_id] = attempt
+        response = self.client.post(
+            "/v1/auth/chatgpt/cancel", headers=self.headers, json={"login_id": login_id})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "cancelled"})
+        self.assertTrue(fake.closed)
+        self.assertTrue(attempt["cancel"].is_set())
+        self.assertEqual(attempt["state"], "")
+        self.assertEqual(attempt["nonce"], "")
+        self.assertEqual(attempt["verifier"], "")
+        status = self.client.get(
+            "/v1/auth/chatgpt/status", headers=self.headers, params={"login_id": login_id}).json()
+        self.assertEqual(status["status"], "cancelled")
+
+    def test_cancel_unknown_login_id_is_404(self):
+        response = self.client.post(
+            "/v1/auth/chatgpt/cancel", headers=self.headers, json={"login_id": "missing"})
+        self.assertEqual(response.status_code, 404)
+
+    def test_logout_revokes_and_clears_local_state(self):
+        account = object()
+        deleted = {}
+        with patch.object(sidecar_module.codex_accounts, "load_account", return_value=account), \
+             patch.object(sidecar_module.codex_auth, "revoke", return_value=True) as revoke, \
+             patch.object(sidecar_module.codex_accounts, "delete_account",
+                          side_effect=lambda aid: deleted.__setitem__("id", aid)) as delete, \
+             patch.object(sidecar_module.codex_accounts, "active_account_id", return_value="acct-1"), \
+             patch.object(sidecar_module.codex_accounts, "set_active_account") as set_active:
+            Runtime.chatgpt_account_id = "acct-1"
+            Runtime.chatgpt_account = {"account_id": "acct-1", "label": "", "email": "", "plan_enabled": False}
+            response = self.client.post(
+                "/v1/auth/chatgpt/logout", headers=self.headers, json={"account_id": "acct-1"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"status": "revoked"})
+        revoke.assert_called_once_with(account)
+        self.assertEqual(deleted["id"], "acct-1")
+        delete.assert_called_once_with("acct-1")
+        set_active.assert_called_once_with(None)
+        self.assertIsNone(Runtime.chatgpt_account_id)
+        self.assertIsNone(Runtime.chatgpt_account)
+        self.assertNotIn("access_token", response.text)
+
+    def test_logout_is_unconfirmed_when_revoke_fails(self):
+        with patch.object(sidecar_module.codex_accounts, "load_account", return_value=object()), \
+             patch.object(sidecar_module.codex_auth, "revoke", side_effect=RuntimeError("boom")), \
+             patch.object(sidecar_module.codex_accounts, "delete_account") as delete, \
+             patch.object(sidecar_module.codex_accounts, "active_account_id", return_value=None):
+            response = self.client.post(
+                "/v1/auth/chatgpt/logout", headers=self.headers, json={"account_id": "acct-1"})
+        self.assertEqual(response.json(), {"status": "revoke_unconfirmed"})
+        delete.assert_called_once_with("acct-1")
+
+    def test_accounts_returns_metadata_only(self):
+        metadata = [{"account_id": "a1", "label": "L", "email": "e@example.com", "plan_enabled": True}]
+        with patch.object(sidecar_module.codex_accounts, "list_accounts", return_value=metadata):
+            response = self.client.get("/v1/auth/chatgpt/accounts", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"accounts": metadata})
+        self.assertNotIn("token", response.text.lower())
+
+    def test_accounts_reports_active_account_metadata_in_configure(self):
+        self._enable_chatgpt()
+        metadata = {"account_id": "a1", "label": "L", "email": "e@example.com", "plan_enabled": True}
+        with patch.object(sidecar_module.sys, "platform", "darwin"), \
+             patch.object(sidecar_module.codex_accounts, "active_account_id", return_value="a1"), \
+             patch.object(sidecar_module.codex_accounts, "list_accounts", return_value=[metadata]):
+            body = self.client.get("/v1/configure", headers=self.headers).json()
+        self.assertEqual(body["chatgpt_account"], metadata)
+
+    def test_shutdown_cancels_pending_attempts_without_changing_response(self):
+        login_id = "login-shutdown"
+        attempt = self._attempt(login_id)
+        fake = _FakeLoopback()
+        attempt["loopback"] = fake
+        attempt["state"] = "STATE"
+        attempt["verifier"] = "VERIFIER"
+        Runtime.auth_attempts[login_id] = attempt
+        with patch.object(sidecar_module.threading, "Thread"):
+            response = self.client.post("/v1/shutdown", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True})
+        self.assertTrue(fake.closed)
+        self.assertTrue(attempt["cancel"].is_set())
+        self.assertEqual(attempt["verifier"], "")
 
 
 if __name__ == "__main__":

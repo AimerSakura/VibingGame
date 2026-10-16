@@ -10,12 +10,18 @@ import logging
 import mimetypes
 import os
 import queue
+import re
+import secrets
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import uuid
+import webbrowser
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
@@ -34,6 +40,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from vibe_tools import codex_accounts, codex_auth
 from vibe_tools.agent import ChatHistoryStore, GameGenerator
 from vibe_tools.editor_credentials import CredentialError, credential, credential_backend
 from vibe_tools.editor_language import LanguageProvider
@@ -62,6 +69,20 @@ class Runtime:
     run_lock = threading.Lock()
     mutex = threading.RLock()
     server: Any = None
+    # Sign in with ChatGPT (SIWC) state. Only non-sensitive values live here:
+    # tokens stay in the OS keychain and never in Runtime, files or logs.
+    auth_mode = "api_key"
+    auth_attempts: dict[str, dict[str, Any]] = {}
+    auth_lock = threading.Lock()
+    chatgpt_account_id: str | None = None
+    chatgpt_account: dict[str, Any] | None = None
+    codex_exe = ""
+    codex_version = ""
+    codex_probed = False
+    # Non-sensitive app-server bookkeeping; the process itself is owned by the
+    # next integration step and is deliberately not started or stopped here.
+    app_server_status = "stopped"
+    app_server_account_id: str | None = None
 
 
 class ConfigureRequest(BaseModel):
@@ -70,6 +91,16 @@ class ConfigureRequest(BaseModel):
     base_url: str = ""
     model: str = "claude-sonnet-4-20250514"
     vision_model: str = "gemini-2.5-flash"
+    auth_mode: Literal["api_key", "chatgpt"] | None = None
+    chatgpt_account_id: str | None = None
+
+
+class ChatGptLoginRequest(BaseModel):
+    login_id: str
+
+
+class ChatGptLogoutRequest(BaseModel):
+    account_id: str
 
 
 class AgentRequest(BaseModel):
@@ -551,8 +582,365 @@ def health() -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- #
+# Sign in with ChatGPT (SIWC) support
+# --------------------------------------------------------------------------- #
+
+_SAFE_AUTH_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_CODEX_VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.]+)?")
+_CHATGPT_UNSUPPORTED = "ChatGPT sign-in is not supported on this platform yet"
+
+
+def _is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _resolve_codex_exe() -> str:
+    """Locate a usable codex executable.
+
+    Order: ``VIBE_CODEX_BIN`` then ``CODEX_BIN``, then the current ``PATH``,
+    then ``~/.local/bin/codex``. Only regular executable files are accepted,
+    and no token, model or working directory is ever appended to the command.
+    """
+    candidates: list[str] = []
+    for variable in ("VIBE_CODEX_BIN", "CODEX_BIN"):
+        value = os.environ.get(variable)
+        if value:
+            candidates.append(value)
+    on_path = shutil.which("codex")
+    if on_path:
+        candidates.append(on_path)
+    candidates.append(os.path.join(os.path.expanduser("~"), ".local", "bin", "codex"))
+    for candidate in candidates:
+        try:
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        except OSError:
+            continue
+    return ""
+
+
+def _codex_version(exe: str) -> str:
+    """Return only a safe version token (or ``""``); never stderr or errors."""
+    if not exe:
+        return ""
+    try:
+        completed = subprocess.run(
+            [exe, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    if getattr(completed, "returncode", 1) != 0:
+        return ""
+    try:
+        text = (completed.stdout or b"").decode("utf-8", "replace")
+    except Exception:
+        return ""
+    match = _CODEX_VERSION_RE.search(text)
+    return match.group(0)[:128] if match else ""
+
+
+def _codex_capability() -> tuple[bool, str]:
+    """Return ``(chatgpt_supported, codex_version)`` for the current platform."""
+    if not _is_macos():
+        return False, ""
+    if not Runtime.codex_probed:
+        Runtime.codex_exe = _resolve_codex_exe()
+        Runtime.codex_version = _codex_version(Runtime.codex_exe) if Runtime.codex_exe else ""
+        Runtime.codex_probed = True
+    return bool(Runtime.codex_exe), Runtime.codex_version
+
+
+def _effective_auth_mode(supported: bool) -> str:
+    if not supported or Runtime.auth_mode not in ("api_key", "chatgpt"):
+        return "api_key"
+    return Runtime.auth_mode
+
+
+def _account_metadata(account: codex_auth.CodexAccount) -> dict[str, Any]:
+    return {
+        "account_id": account.account_id,
+        "label": account.label,
+        "email": account.email,
+        "plan_enabled": bool(account.plan_enabled),
+    }
+
+
+def _active_account_metadata() -> dict[str, Any] | None:
+    try:
+        account_id = Runtime.chatgpt_account_id or codex_accounts.active_account_id()
+    except Exception:
+        account_id = Runtime.chatgpt_account_id
+    if not account_id:
+        Runtime.chatgpt_account = None
+        return None
+    try:
+        accounts = codex_accounts.list_accounts()
+    except Exception:
+        accounts = []
+    for item in accounts:
+        if not isinstance(item, dict) or str(item.get("account_id")) != str(account_id):
+            continue
+        metadata = {
+            "account_id": str(item.get("account_id", "")),
+            "label": str(item.get("label", "")),
+            "email": str(item.get("email", "")),
+            "plan_enabled": bool(item.get("plan_enabled", False)),
+        }
+        Runtime.chatgpt_account = metadata
+        return metadata
+    Runtime.chatgpt_account = None
+    return None
+
+
+def _safe_auth_error_code(error: BaseException) -> str:
+    message = str(error) if isinstance(error, codex_auth.CodexAuthError) else ""
+    if message and _SAFE_AUTH_CODE_RE.fullmatch(message):
+        return message
+    return "auth_failed"
+
+
+def _clear_attempt_secrets(attempt: dict[str, Any]) -> None:
+    attempt["state"] = ""
+    attempt["nonce"] = ""
+    attempt["verifier"] = ""
+
+
+def _check_cancelled(attempt: dict[str, Any]) -> None:
+    if attempt["cancel"].is_set():
+        raise codex_auth.CodexAuthError("cancelled")
+
+
+def _mark_completed(attempt: dict[str, Any], account: codex_auth.CodexAccount) -> None:
+    metadata = _account_metadata(account)
+    with Runtime.auth_lock:
+        if attempt.get("status") == "cancelled" or attempt["cancel"].is_set():
+            attempt["status"] = "cancelled"
+            return
+        attempt["status"] = "completed"
+        attempt["error"] = None
+        attempt["account"] = metadata
+        Runtime.chatgpt_account = metadata
+        Runtime.chatgpt_account_id = account.account_id
+
+
+def _mark_failed(attempt: dict[str, Any], code: str) -> None:
+    with Runtime.auth_lock:
+        if attempt.get("status") == "cancelled":
+            return
+        if code == "cancelled" or attempt["cancel"].is_set():
+            attempt["status"] = "cancelled"
+            attempt["error"] = None
+        else:
+            attempt["status"] = "failed"
+            attempt["error"] = code
+
+
+def _resolve_jwks(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        raise codex_auth.CodexAuthError("discovery_failed")
+    keys = metadata.get("keys")
+    if isinstance(keys, list) and keys:
+        return {"keys": keys}
+    jwks_uri = metadata.get("jwks_uri")
+    if not isinstance(jwks_uri, str) or not jwks_uri.startswith(("https://", "http://")):
+        raise codex_auth.CodexAuthError("discovery_failed")
+    request = urllib.request.Request(jwks_uri, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read()
+    except Exception:
+        raise codex_auth.CodexAuthError("discovery_failed") from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        raise codex_auth.CodexAuthError("discovery_failed") from None
+    if not isinstance(data, dict):
+        raise codex_auth.CodexAuthError("discovery_failed")
+    return data
+
+
+def _build_account(
+    *,
+    existing_account: codex_auth.CodexAccount | None,
+    client_id: str,
+    host: str,
+    id_token: str,
+    response: dict[str, Any],
+    claims: dict[str, Any],
+    scopes: tuple[str, ...],
+) -> codex_auth.CodexAccount:
+    subject = str(claims.get("sub") or (existing_account.subject if existing_account else ""))
+    issuer = str(claims.get("iss") or codex_auth.ISSUER)
+    email = str(claims.get("email") or (existing_account.email if existing_account else ""))
+    label = str(claims.get("name") or email or (existing_account.label if existing_account else ""))
+    access_token = str(response.get("access_token") or "")
+    refresh_token = str(response.get("refresh_token") or (existing_account.refresh_token if existing_account else ""))
+    try:
+        expires_in = int(response.get("expires_in") or 0)
+    except (TypeError, ValueError):
+        expires_in = 0
+    now = time.time()
+    return codex_auth.CodexAccount(
+        account_id=codex_accounts.account_id_for(issuer=issuer, subject=subject, client_id=client_id),
+        label=label,
+        email=email,
+        issuer=issuer,
+        subject=subject,
+        client_id=client_id,
+        ext_agent_host_id=host,
+        id_token=id_token,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        token_type=str(response.get("token_type") or "Bearer"),
+        expires_in=expires_in,
+        earliest_refresh_at=int(now) + expires_in - codex_auth.REFRESH_SKEW_S,
+        scopes=tuple(scopes),
+        saved_at=datetime.now(timezone.utc).isoformat(),
+        plan_enabled=codex_auth.plan_enabled(scopes),
+    )
+
+
+def _wait_for_callback(attempt: dict[str, Any], loopback) -> dict[str, str]:
+    deadline = time.monotonic() + codex_auth.CALLBACK_TIMEOUT_S
+    while True:
+        _check_cancelled(attempt)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise codex_auth.CodexAuthError("callback_timeout")
+        try:
+            return loopback.wait(min(1.0, remaining))
+        except codex_auth.CodexAuthError as error:
+            if str(error) != "callback_timeout":
+                raise
+            continue
+
+
+def _chatgpt_login_worker(attempt: dict[str, Any], existing_account: codex_auth.CodexAccount | None) -> None:
+    login_id = attempt["id"]
+    loopback = None
+    try:
+        host = codex_auth.host_id()
+        state = secrets.token_urlsafe(32)
+        nonce = secrets.token_urlsafe(32)
+        verifier, challenge = codex_auth.new_pkce()
+        attempt["state"] = state
+        attempt["nonce"] = nonce
+        attempt["verifier"] = verifier
+        is_new = existing_account is None
+        client_id = codex_auth.DYNAMIC_CLIENT_ID if is_new else existing_account.client_id
+        loopback = codex_auth.LoopbackCallback()
+        redirect_uri = loopback.start()
+        attempt["loopback"] = loopback
+        if is_new:
+            hints: dict[str, str | None] = {"agent_name_hint": codex_auth.AGENT_NAME_HINT}
+        else:
+            hints = {"id_token_hint": existing_account.id_token or None,
+                     "login_hint": existing_account.email or None}
+        auth_url = codex_auth.build_authorize_url(
+            client_id=client_id, host_id=host, state=state, nonce=nonce,
+            challenge=challenge, redirect_uri=redirect_uri, **hints)
+        _check_cancelled(attempt)
+        webbrowser.open(auth_url)
+        query = _wait_for_callback(attempt, loopback)
+        _check_cancelled(attempt)
+        validated = codex_auth.validate_callback(
+            query, expected_state=state, issued_client_id_expected=is_new)
+        callback_client_id = validated.get("client_id") or ""
+        if is_new:
+            client_id = callback_client_id
+        elif callback_client_id and callback_client_id != existing_account.client_id:
+            raise codex_auth.CodexAuthError("client_id_mismatch")
+        _check_cancelled(attempt)
+        response = codex_auth.exchange_code(
+            client_id=client_id, code=validated["code"], verifier=verifier,
+            redirect_uri=redirect_uri)
+        id_token = str(response.get("id_token") or "")
+        if not id_token:
+            raise codex_auth.CodexAuthError("invalid_id_token")
+        claims = codex_auth.validate_id_token(
+            id_token, jwks=_resolve_jwks(codex_auth.discover()), client_id=client_id,
+            nonce=nonce, issuer=codex_auth.ISSUER)
+        raw_scope = response.get("scope") or claims.get("scope") or ""
+        scopes = tuple(str(raw_scope).split())
+        account = _build_account(
+            existing_account=existing_account, client_id=client_id, host=host,
+            id_token=id_token, response=response, claims=claims, scopes=scopes)
+        _check_cancelled(attempt)
+        codex_accounts.save_account(account)
+        codex_accounts.set_active_account(account.account_id)
+        _mark_completed(attempt, account)
+        log.info("chatgpt auth completed login_id=%s", login_id)
+    except codex_auth.CodexAuthError as error:
+        _mark_failed(attempt, _safe_auth_error_code(error))
+    except Exception as error:  # never surface exception text: it may carry secrets
+        log.warning("chatgpt auth failed login_id=%s error_class=%s", login_id, type(error).__name__)
+        _mark_failed(attempt, "auth_failed")
+    finally:
+        if loopback is not None:
+            try:
+                loopback.close()
+            except Exception:
+                pass
+        _clear_attempt_secrets(attempt)
+
+
+def _start_login_thread(attempt: dict[str, Any], existing_account: codex_auth.CodexAccount | None) -> None:
+    thread = threading.Thread(
+        target=_chatgpt_login_worker,
+        args=(attempt, existing_account),
+        name="godotvibe-chatgpt-login",
+        daemon=True,
+    )
+    attempt["thread"] = thread
+    thread.start()
+
+
+def _login_existing_account() -> codex_auth.CodexAccount | None:
+    account_id = Runtime.chatgpt_account_id
+    if not account_id:
+        try:
+            account_id = codex_accounts.active_account_id()
+        except Exception:
+            return None
+    if not account_id:
+        return None
+    try:
+        return codex_accounts.load_account(account_id)
+    except Exception:
+        return None
+
+
+def _shutdown_auth_attempts() -> None:
+    with Runtime.auth_lock:
+        attempts = list(Runtime.auth_attempts.values())
+    for attempt in attempts:
+        cancel = attempt.get("cancel")
+        if cancel is not None:
+            cancel.set()
+        loopback = attempt.get("loopback")
+        if loopback is not None:
+            try:
+                loopback.close()
+            except Exception:
+                pass
+        _clear_attempt_secrets(attempt)
+
+
 def _configure_payload(has_api_key: bool) -> dict[str, Any]:
-    payload = {**Runtime.config, "has_api_key": has_api_key, "protocol_version": PROTOCOL_VERSION}
+    supported, codex_version = _codex_capability()
+    payload = {
+        **Runtime.config,
+        "has_api_key": has_api_key,
+        "protocol_version": PROTOCOL_VERSION,
+        "auth_mode": _effective_auth_mode(supported),
+        "chatgpt_supported": supported,
+        "chatgpt_account": _active_account_metadata() if supported else None,
+        "codex_version": codex_version,
+    }
     try:
         payload["credential_store"] = credential_backend()
     except CredentialError as error:
@@ -575,12 +963,20 @@ def get_configuration() -> dict[str, Any]:
 def configure(request: ConfigureRequest) -> dict[str, Any]:
     if Runtime.run_lock.locked():
         raise HTTPException(409, "任务期间不能修改模型配置")
+    if request.auth_mode == "chatgpt":
+        supported, _ = _codex_capability()
+        if not supported:
+            raise HTTPException(409, _CHATGPT_UNSUPPORTED)
     if request.api_key:
         try:
             credential("api_key", request.api_key)
         except CredentialError as error:
             raise HTTPException(500, str(error)) from error
-    Runtime.config = request.model_dump(exclude={"api_key"})
+    Runtime.config = request.model_dump(exclude={"api_key", "auth_mode", "chatgpt_account_id"})
+    if request.auth_mode is not None:
+        Runtime.auth_mode = request.auth_mode
+    if request.chatgpt_account_id is not None:
+        Runtime.chatgpt_account_id = request.chatgpt_account_id or None
     try:
         has_api_key = bool(credential("api_key"))
     except CredentialError as error:
@@ -588,6 +984,115 @@ def configure(request: ConfigureRequest) -> dict[str, Any]:
         payload["credential_error"] = str(error)
         return payload
     return _configure_payload(has_api_key)
+
+
+@app.post("/v1/auth/chatgpt/start")
+def chatgpt_start() -> dict[str, Any]:
+    supported, _ = _codex_capability()
+    if not supported:
+        raise HTTPException(409, _CHATGPT_UNSUPPORTED)
+    with Runtime.auth_lock:
+        if any(item.get("status") == "authorizing" for item in Runtime.auth_attempts.values()):
+            raise HTTPException(409, "已有登录流程正在进行")
+        login_id = uuid.uuid4().hex
+        attempt = {
+            "id": login_id,
+            "status": "authorizing",
+            "error": None,
+            "account": None,
+            "loopback": None,
+            "state": "",
+            "nonce": "",
+            "verifier": "",
+            "cancel": threading.Event(),
+            "created": time.time(),
+            "thread": None,
+        }
+        Runtime.auth_attempts[login_id] = attempt
+        existing = _login_existing_account()
+    _start_login_thread(attempt, existing)
+    # Never return the authorize URL, PKCE material, codes or tokens.
+    return {"login_id": login_id, "status": "authorizing"}
+
+
+@app.get("/v1/auth/chatgpt/status")
+def chatgpt_status(login_id: str) -> dict[str, Any]:
+    with Runtime.auth_lock:
+        attempt = Runtime.auth_attempts.get(login_id)
+        if attempt is None:
+            raise HTTPException(404, "登录流程不存在")
+        status = attempt.get("status", "pending")
+        error = attempt.get("error")
+        account = attempt.get("account")
+    if status == "authorizing":
+        status = "pending"
+    payload: dict[str, Any] = {"status": status}
+    if status == "completed" and account:
+        payload["account"] = dict(account)
+    elif status == "failed":
+        payload["error"] = error or "auth_failed"
+    return payload
+
+
+@app.post("/v1/auth/chatgpt/cancel")
+def chatgpt_cancel(request: ChatGptLoginRequest) -> dict[str, Any]:
+    login_id = request.login_id
+    with Runtime.auth_lock:
+        attempt = Runtime.auth_attempts.get(login_id)
+        if attempt is None:
+            raise HTTPException(404, "登录流程不存在")
+        attempt["status"] = "cancelled"
+        attempt["error"] = None
+        attempt["cancel"].set()
+        loopback = attempt.get("loopback")
+        _clear_attempt_secrets(attempt)
+    if loopback is not None:
+        try:
+            loopback.close()
+        except Exception:
+            pass
+    return {"status": "cancelled"}
+
+
+@app.post("/v1/auth/chatgpt/logout")
+def chatgpt_logout(request: ChatGptLogoutRequest) -> dict[str, Any]:
+    account_id = request.account_id
+    try:
+        account = codex_accounts.load_account(account_id)
+    except Exception:
+        account = None
+    confirmed = False
+    if account is not None:
+        try:
+            confirmed = bool(codex_auth.revoke(account))
+        except Exception:
+            confirmed = False
+    # Clear local state regardless of whether remote revocation was confirmed.
+    try:
+        codex_accounts.delete_account(account_id)
+    except Exception:
+        pass
+    try:
+        if codex_accounts.active_account_id() == account_id:
+            codex_accounts.set_active_account(None)
+    except Exception:
+        pass
+    with Runtime.auth_lock:
+        if Runtime.chatgpt_account_id == account_id:
+            Runtime.chatgpt_account_id = None
+        Runtime.chatgpt_account = None
+    Runtime.app_server_status = "stopped"
+    Runtime.app_server_account_id = None
+    return {"status": "revoked" if confirmed else "revoke_unconfirmed"}
+
+
+@app.get("/v1/auth/chatgpt/accounts")
+def chatgpt_accounts() -> dict[str, Any]:
+    try:
+        accounts = codex_accounts.list_accounts()
+    except Exception:
+        accounts = []
+    return {"accounts": accounts}
 
 
 @app.get("/v1/chat/history")
@@ -710,6 +1215,8 @@ def harness_artifact(artifact_path: str):
 
 @app.post("/v1/shutdown")
 def shutdown() -> dict[str, Any]:
+    _shutdown_auth_attempts()
+
     def stop() -> None:
         time.sleep(0.1)
         if Runtime.server is not None:
@@ -781,6 +1288,7 @@ def main() -> None:
     Runtime.loopback_url = f"http://127.0.0.1:{port}"
     _write_handshake(port)
     atexit.register(lambda: Runtime.handshake.unlink(missing_ok=True))
+    atexit.register(_shutdown_auth_attempts)
     import uvicorn
     Runtime.server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False, log_config=None))
     threading.Thread(target=_watch_parent, name="godotvibe-parent-watchdog", daemon=True).start()
