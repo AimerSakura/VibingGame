@@ -163,11 +163,18 @@ bool DisplayServerMacOSBase::clipboard_has_image() const {
 }
 
 CGDirectDisplayID DisplayServerMacOSBase::_get_display_id_for_screen(NSScreen *p_screen) {
+	// `CGDirectDisplayID` is only declared on NSScreen by the macOS 26 SDK, so the
+	// macOS 15 SDK cannot compile the direct call. `NSScreenNumber` is a documented
+	// fallback that returns the same CGDirectDisplayID at runtime.
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
 	if (@available(macOS 26.0, *)) {
 		return [p_screen CGDirectDisplayID];
 	} else {
 		return [[p_screen deviceDescription][@"NSScreenNumber"] unsignedIntValue];
 	}
+#else
+	return [[p_screen deviceDescription][@"NSScreenNumber"] unsignedIntValue];
+#endif
 }
 
 void DisplayServerMacOSBase::initialize_tts() const {
