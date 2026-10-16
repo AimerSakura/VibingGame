@@ -739,6 +739,73 @@ class ChatGptAuthTest(unittest.TestCase):
         self.assertEqual(attempt["verifier"], "")
 
 
+class CodexExeResolutionTest(unittest.TestCase):
+    """Bundled-layout resolution and precedence for ``_resolve_codex_exe``.
+
+    Everything is built under a temporary directory; the tests never read the
+    real ``~/.codex`` or any credential store.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        # Packaged PyInstaller onedir sidecar layout.
+        self.vibe_agent = self.root / "Contents" / "Resources" / "vibe_agent"
+        self.sidecar_dir = self.vibe_agent / "godotvibe-agent"
+        self.sidecar_dir.mkdir(parents=True)
+        self.sidecar_exe = self.sidecar_dir / "godotvibe-agent"
+        self.sidecar_exe.write_bytes(b"stub")
+        self.bundled = self.vibe_agent / "codex" / "bin" / "codex"
+        self.bundled.parent.mkdir(parents=True)
+        self.bundled.write_text("#!/bin/sh\n", encoding="utf-8")
+        self.bundled.chmod(0o755)
+        self.env = patch.dict(os.environ, {"VIBE_CODEX_BIN": "", "CODEX_BIN": ""})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+
+    @contextlib.contextmanager
+    def _isolated_lookup(self, *, which=None):
+        with patch.object(sidecar_module.sys, "executable", str(self.sidecar_exe)), \
+             patch.object(sidecar_module.sys, "_MEIPASS", "", create=True), \
+             patch.object(sidecar_module.shutil, "which", return_value=which), \
+             patch.object(sidecar_module.os.path, "expanduser", return_value=str(self.root)):
+            yield
+
+    def _make_executable(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n", encoding="utf-8")
+        path.chmod(0o755)
+        return path
+
+    def test_resolves_bundled_codex_from_sidecar_layout(self):
+        with self._isolated_lookup():
+            self.assertEqual(sidecar_module._resolve_codex_exe(), str(self.bundled))
+
+    def test_env_override_takes_precedence_over_bundled(self):
+        override = self._make_executable(self.root / "custom" / "codex")
+        with patch.dict(os.environ, {"VIBE_CODEX_BIN": str(override)}), self._isolated_lookup():
+            self.assertEqual(sidecar_module._resolve_codex_exe(), str(override))
+
+    def test_bundled_codex_takes_precedence_over_path(self):
+        with self._isolated_lookup(which="/path/from-path/codex"):
+            self.assertEqual(sidecar_module._resolve_codex_exe(), str(self.bundled))
+
+    def test_invalid_bundled_codex_falls_back_to_home(self):
+        self.bundled.chmod(0o644)
+        home = self._make_executable(self.root / ".local" / "bin" / "codex")
+        with self._isolated_lookup(which=None):
+            self.assertEqual(sidecar_module._resolve_codex_exe(), str(home))
+
+    def test_path_is_used_when_bundle_is_absent(self):
+        self.bundled.unlink()
+        path_exe = self._make_executable(self.root / "path-bin" / "codex")
+        with self._isolated_lookup(which=str(path_exe)):
+            self.assertEqual(sidecar_module._resolve_codex_exe(), str(path_exe))
+
+
 class _FakeCodexProvider:
     """Offline stand-in for CodexProvider; records the stage it was handed."""
 

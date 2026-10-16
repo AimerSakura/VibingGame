@@ -695,18 +695,56 @@ def _is_macos() -> bool:
     return sys.platform == "darwin"
 
 
+def _sidecar_bundle_roots() -> list[Path]:
+    """Directories that may contain the bundled Codex layout.
+
+    The packaged PyInstaller onedir sidecar runs from
+    ``.../Contents/Resources/vibe_agent/godotvibe-agent/godotvibe-agent`` and
+    the Codex release is copied to
+    ``.../Contents/Resources/vibe_agent/codex``. ``_MEIPASS`` is included
+    because PyInstaller versions differ on whether it points at the executable
+    directory or its private ``_internal`` directory.
+    """
+    roots: list[Path] = []
+    anchors: list[Path] = []
+    executable = getattr(sys, "executable", "") or ""
+    if executable:
+        anchors.append(Path(executable))
+    bundle_dir = getattr(sys, "_MEIPASS", "") or ""
+    if bundle_dir:
+        anchors.append(Path(bundle_dir))
+    for anchor in anchors:
+        for root in (anchor.parent.parent, anchor.parent):
+            if root not in roots:
+                roots.append(root)
+    return roots
+
+
+def _bundled_codex_candidates() -> list[str]:
+    """Executable candidates for the Codex layout shipped inside the app."""
+    candidates: list[str] = []
+    for root in _sidecar_bundle_roots():
+        candidate = str(root / "codex" / "bin" / "codex")
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
 def _resolve_codex_exe() -> str:
     """Locate a usable codex executable.
 
-    Order: ``VIBE_CODEX_BIN`` then ``CODEX_BIN``, then the current ``PATH``,
-    then ``~/.local/bin/codex``. Only regular executable files are accepted,
-    and no token, model or working directory is ever appended to the command.
+    Order: ``VIBE_CODEX_BIN`` then ``CODEX_BIN``, then the Codex layout bundled
+    next to the PyInstaller onedir sidecar (``.../vibe_agent/codex/bin/codex``),
+    then the current ``PATH``, then ``~/.local/bin/codex``. Only regular
+    executable files are accepted, and no token, model or working directory is
+    ever appended to the command.
     """
     candidates: list[str] = []
     for variable in ("VIBE_CODEX_BIN", "CODEX_BIN"):
         value = os.environ.get(variable)
         if value:
             candidates.append(value)
+    candidates.extend(_bundled_codex_candidates())
     on_path = shutil.which("codex")
     if on_path:
         candidates.append(on_path)
