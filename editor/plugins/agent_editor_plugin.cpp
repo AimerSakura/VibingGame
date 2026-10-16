@@ -76,6 +76,24 @@ static String _agent_auth_text(const Variant &p_value, int p_max) {
 	return out.strip_edges();
 }
 
+static String _agent_model_id_text(const Variant &p_value) {
+	// Model ids are non-secret display/JSON values: keep a bounded, shell-safe
+	// alphabet so nothing control-like ever reaches a widget or a request body.
+	String text = _agent_auth_text(p_value, 200);
+	if (text.is_empty() || text.length() > 200) {
+		return String();
+	}
+	for (int index = 0; index < text.length(); index++) {
+		const char32_t c = text[index];
+		const bool allowed = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				c == '-' || c == '_' || c == '.' || c == '/' || c == ':' || c == '@' || c == '+';
+		if (!allowed) {
+			return String();
+		}
+	}
+	return text;
+}
+
 static Dictionary _agent_auth_account(const Dictionary &p_response) {
 	Variant nested = p_response.get("chatgpt_account", Variant());
 	if (nested.get_type() == Variant::DICTIONARY) {
@@ -341,9 +359,15 @@ void AgentWorkspace::_push_configuration(bool p_include_key) {
 	const bool chatgpt = _chatgpt_mode_active();
 	Dictionary body;
 	body["api_key"] = (p_include_key && !chatgpt) ? api_key->get_text() : String();
+	// API Key 与 Codex 模型分别提交，互不覆盖；codex_model 只取模型列表/持久化值。
 	body["base_url"] = base_url->get_text().strip_edges();
 	body["model"] = model->get_text().strip_edges();
 	body["vision_model"] = vision_model->get_text().strip_edges();
+	String codex_model_id = _codex_model_id();
+	if (codex_model_id.is_empty()) {
+		codex_model_id = String(EDITOR_DEF("vibe_agent/codex_model", "")).strip_edges();
+	}
+	body["codex_model"] = codex_model_id;
 	body["response_language"] = response_language->get_item_metadata(response_language->get_selected());
 	body["auth_mode"] = chatgpt ? "chatgpt" : "api_key";
 	if (chatgpt) {
@@ -361,6 +385,191 @@ bool AgentWorkspace::_chatgpt_mode_active() const {
 #else
 	return false;
 #endif
+}
+
+bool AgentWorkspace::_auth_mode_selected() const {
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
+	if (!auth_mode || !chatgpt_supported || chatgpt_codex_version.is_empty()) {
+		return false;
+	}
+	return auth_mode->get_selected() == 1;
+#else
+	return false;
+#endif
+}
+
+String AgentWorkspace::_codex_model_id() const {
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
+	if (!codex_model) {
+		return String();
+	}
+	const int index = codex_model->get_selected();
+	if (index < 0) {
+		return String();
+	}
+	Variant metadata = codex_model->get_item_metadata(index);
+	if (metadata.get_type() == Variant::DICTIONARY) {
+		return _agent_model_id_text(Dictionary(metadata).get("id", ""));
+	}
+	return _agent_model_id_text(metadata);
+#else
+	return String();
+#endif
+}
+
+void AgentWorkspace::_request_models() {
+	if (!backend_ready || request_kind != REQUEST_NONE) {
+		return;
+	}
+	_request("/v1/models", HTTPClient::METHOD_GET, Dictionary(), REQUEST_MODELS);
+}
+
+void AgentWorkspace::_update_codex_image_capability() {
+	// ChatGPT 模式只有模型声明 image input modality 时才允许添加参考图片；
+	// 未确认/未知一律按不支持处理，避免把图片发到不支持视觉的模型。
+	codex_image_supported = true;
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
+	if (codex_model) {
+		const int index = codex_model->get_selected();
+		if (index < 0) {
+			codex_image_supported = false;
+		} else {
+			Variant metadata = codex_model->get_item_metadata(index);
+			if (metadata.get_type() == Variant::DICTIONARY) {
+				codex_image_supported = _agent_auth_flag(Dictionary(metadata).get("supports_image", Variant()), true);
+			} else {
+				codex_image_supported = false;
+			}
+		}
+	}
+#endif
+	if (attach_button) {
+		attach_button->set_disabled(_chatgpt_mode_active() && !codex_image_supported);
+	}
+}
+
+void AgentWorkspace::_apply_model_catalog(const Dictionary &p_response) {
+	const String mode = String(p_response.get("mode", "")).strip_edges().to_lower();
+	const bool manual = _agent_auth_flag(p_response.get("manual", Variant()), false);
+	const String error = _agent_auth_text(p_response.get("error", ""), 64);
+	Array models = p_response.get("models", Array());
+	if (mode == "chatgpt") {
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
+		if (codex_model) {
+			String previous = _codex_model_id();
+			if (previous.is_empty()) {
+				previous = String(EDITOR_DEF("vibe_agent/codex_model", "")).strip_edges();
+			}
+			codex_model->clear();
+			int default_index = -1;
+			for (int index = 0; index < models.size(); index++) {
+				if (models[index].get_type() != Variant::DICTIONARY) {
+					continue;
+				}
+				Dictionary entry = models[index];
+				String id = _agent_model_id_text(entry.get("id", ""));
+				if (id.is_empty()) {
+					continue;
+				}
+				const bool supports_image = _agent_auth_flag(entry.get("supports_image", Variant()), false);
+				String label = _agent_auth_text(entry.get("display_name", entry.get("label", id)), 120);
+				if (label.is_empty()) {
+					label = id;
+				}
+				Dictionary metadata;
+				metadata["id"] = id;
+				metadata["supports_image"] = supports_image;
+				codex_model->add_item(label);
+				codex_model->set_item_metadata(codex_model->get_item_count() - 1, metadata);
+				if (_agent_auth_flag(entry.get("is_default", Variant()), false)) {
+					default_index = codex_model->get_item_count() - 1;
+				}
+			}
+			int selected = -1;
+			for (int index = 0; index < codex_model->get_item_count(); index++) {
+				Variant metadata = codex_model->get_item_metadata(index);
+				String id;
+				if (metadata.get_type() == Variant::DICTIONARY) {
+					id = _agent_model_id_text(Dictionary(metadata).get("id", ""));
+				} else {
+					id = _agent_model_id_text(metadata);
+				}
+				if (!previous.is_empty() && id == previous) {
+					selected = index;
+					break;
+				}
+			}
+			if (selected < 0) {
+				selected = default_index;
+			}
+			if (selected < 0 && codex_model->get_item_count() > 0) {
+				selected = 0;
+			}
+			if (selected >= 0) {
+				codex_model->select(selected);
+			}
+			codex_model->set_disabled(codex_model->get_item_count() == 0);
+		}
+		if (codex_model_status) {
+			if (!error.is_empty()) {
+				codex_model_status->set_text(_u8("无法获取 Codex 模型列表，请重新登录 ChatGPT 或检查网络。"));
+			} else if (models.is_empty()) {
+				codex_model_status->set_text(_u8("没有可用的 Codex 模型，请检查账号的 Codex 计划能力。"));
+			} else {
+				codex_model_status->set_text(String());
+			}
+		}
+		_update_codex_image_capability();
+#endif
+		return;
+	}
+	// API Key 模式：接口不支持 models.list 时保留手动输入回退。
+	if (api_model_choices) {
+		api_model_choices->clear();
+		if (manual || models.is_empty()) {
+			api_model_choices->set_disabled(true);
+			if (error == "api_key_missing") {
+				api_model_choices->add_item(_u8("请先保存 API Key，再选择模型"));
+			} else {
+				api_model_choices->add_item(_u8("当前接口不支持模型列表，请手动输入"));
+			}
+			api_model_choices->select(0);
+		} else {
+			api_model_choices->set_disabled(false);
+			api_model_choices->add_item(_u8("从列表选择…"));
+			for (int index = 0; index < models.size(); index++) {
+				if (models[index].get_type() != Variant::DICTIONARY) {
+					continue;
+				}
+				Dictionary entry = models[index];
+				String id = _agent_model_id_text(entry.get("id", ""));
+				if (id.is_empty()) {
+					continue;
+				}
+				String label = _agent_auth_text(entry.get("display_name", entry.get("label", id)), 120);
+				if (label.is_empty()) {
+					label = id;
+				}
+				api_model_choices->add_item(label);
+				api_model_choices->set_item_metadata(api_model_choices->get_item_count() - 1, id);
+			}
+			api_model_choices->select(0);
+		}
+	}
+}
+
+void AgentWorkspace::_on_api_model_choice_selected(int p_index) {
+	if (!api_model_choices || !model || p_index <= 0) {
+		return;
+	}
+	String id = _agent_model_id_text(api_model_choices->get_item_metadata(p_index));
+	if (!id.is_empty()) {
+		model->set_text(id);
+	}
+}
+
+void AgentWorkspace::_on_codex_model_selected(int p_index) {
+	_update_codex_image_capability();
 }
 
 bool AgentWorkspace::_is_chatgpt_request(RequestKind p_kind) const {
@@ -390,6 +599,7 @@ void AgentWorkspace::_apply_config_state(const Dictionary &p_response) {
 			: _u8("已保存到 Windows 凭据管理器");
 	api_key->set_placeholder(p_response.get("has_api_key", false) ? saved_label : _u8("输入 API Key"));
 
+	String previous_account_id = chatgpt_account_id;
 	chatgpt_supported = _agent_auth_flag(p_response.get("chatgpt_supported", Variant()), chatgpt_supported);
 	if (p_response.has("codex_version")) {
 		chatgpt_codex_version = _agent_auth_text(p_response.get("codex_version", ""), 64);
@@ -398,6 +608,11 @@ void AgentWorkspace::_apply_config_state(const Dictionary &p_response) {
 	if (!account.is_empty() && !_apply_chatgpt_account(account)) {
 		// sidecar 返回了无法安全使用的账号标识：保持未登录状态。
 		chatgpt_account_id.clear();
+	}
+	if (chatgpt_account_id != previous_account_id) {
+		// 账号变化后必须重新拉取 Codex 模型列表。
+		models_requested = false;
+		api_models_requested = false;
 	}
 #if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 	if (auth_mode) {
@@ -413,7 +628,15 @@ void AgentWorkspace::_apply_config_state(const Dictionary &p_response) {
 }
 
 void AgentWorkspace::_update_chatgpt_ui() {
-	if (!auth_mode || !chatgpt_section || !chatgpt_status || !chatgpt_account_info || !chatgpt_login_button || !chatgpt_cancel_button || !chatgpt_logout_button) {
+	if (!auth_mode) {
+		// Linux 及其他平台只有 API Key 模式：仍需加载 API 模型列表或保留手动输入。
+		if (backend_ready && request_kind == REQUEST_NONE && !api_models_requested) {
+			api_models_requested = true;
+			_request_models();
+		}
+		return;
+	}
+	if (!chatgpt_section || !chatgpt_status || !chatgpt_account_info || !chatgpt_login_button || !chatgpt_cancel_button || !chatgpt_logout_button) {
 		return;
 	}
 	const bool capable = chatgpt_supported && !chatgpt_codex_version.is_empty();
@@ -423,38 +646,54 @@ void AgentWorkspace::_update_chatgpt_ui() {
 	if (!capable && auth_mode->get_selected() == 1) {
 		auth_mode->select(0);
 	}
-	chatgpt_section->set_visible(capable);
+	const bool chatgpt_selected = capable && auth_mode->get_selected() == 1;
+	// API Key 字段组与 ChatGPT/Codex 字段组按模式互斥显示，绝不混在一起。
+	if (api_section) {
+		api_section->set_visible(!chatgpt_selected);
+	}
+	chatgpt_section->set_visible(chatgpt_selected);
+	const bool logged_in = !chatgpt_account_id.is_empty();
 	if (!capable) {
 		chatgpt_status->set_text(_u8("当前 Codex 版本不支持 ChatGPT 登录"));
 		chatgpt_account_info->set_text(String());
 		chatgpt_login_button->set_disabled(true);
 		chatgpt_cancel_button->set_disabled(true);
 		chatgpt_logout_button->set_disabled(true);
-		return;
-	}
-	const bool logged_in = !chatgpt_account_id.is_empty();
-	if (chatgpt_login_active) {
-		chatgpt_status->set_text(vformat(_u8("等待 ChatGPT 授权完成…（Codex %s）"), chatgpt_codex_version));
-	} else if (logged_in) {
-		chatgpt_status->set_text(vformat(_u8("已登录（Codex %s）"), chatgpt_codex_version));
 	} else {
-		chatgpt_status->set_text(vformat(_u8("未登录（Codex %s）"), chatgpt_codex_version));
-	}
-	// 账号 metadata 仅展示 label/email/plan_enabled；plan_enabled=false 时仍显示账号并明确提示。
-	String info;
-	if (logged_in) {
-		info = chatgpt_account_label;
-		if (!chatgpt_account_email.is_empty() && chatgpt_account_email != chatgpt_account_label) {
-			info += info.is_empty() ? chatgpt_account_email : " (" + chatgpt_account_email + ")";
+		if (chatgpt_login_active) {
+			chatgpt_status->set_text(vformat(_u8("等待 ChatGPT 授权完成…（Codex %s）"), chatgpt_codex_version));
+		} else if (logged_in) {
+			chatgpt_status->set_text(vformat(_u8("已登录（Codex %s）"), chatgpt_codex_version));
+		} else {
+			chatgpt_status->set_text(vformat(_u8("未登录（Codex %s）"), chatgpt_codex_version));
 		}
-		if (!chatgpt_plan_enabled) {
-			info += _u8("\n当前账号不具备 Codex 计划能力，可能无法使用 ChatGPT 账号运行 Agent。");
+		// 账号 metadata 仅展示 label/email/plan_enabled；plan_enabled=false 时仍显示账号并明确提示。
+		String info;
+		if (logged_in) {
+			info = chatgpt_account_label;
+			if (!chatgpt_account_email.is_empty() && chatgpt_account_email != chatgpt_account_label) {
+				info += info.is_empty() ? chatgpt_account_email : " (" + chatgpt_account_email + ")";
+			}
+			if (!chatgpt_plan_enabled) {
+				info += _u8("\n当前账号不具备 Codex 计划能力，可能无法使用 ChatGPT 账号运行 Agent。");
+			}
+		}
+		chatgpt_account_info->set_text(info);
+		chatgpt_login_button->set_disabled(chatgpt_login_active || logged_in || !backend_ready);
+		chatgpt_cancel_button->set_disabled(!chatgpt_login_active || chatgpt_login_id.is_empty());
+		chatgpt_logout_button->set_disabled(chatgpt_login_active || !logged_in || !backend_ready);
+	}
+	_update_codex_image_capability();
+	// 按当前模式拉取各自的模型列表：ChatGPT 只在已登录后拉取，API Key 模式始终允许手动回退。
+	if (backend_ready && request_kind == REQUEST_NONE) {
+		if (chatgpt_selected && logged_in && !models_requested) {
+			models_requested = true;
+			_request_models();
+		} else if (!chatgpt_selected && !api_models_requested) {
+			api_models_requested = true;
+			_request_models();
 		}
 	}
-	chatgpt_account_info->set_text(info);
-	chatgpt_login_button->set_disabled(chatgpt_login_active || logged_in || !backend_ready);
-	chatgpt_cancel_button->set_disabled(!chatgpt_login_active || chatgpt_login_id.is_empty());
-	chatgpt_logout_button->set_disabled(chatgpt_login_active || !logged_in || !backend_ready);
 }
 
 void AgentWorkspace::_refresh_config_state() {
@@ -478,6 +717,13 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 		}
 		if (completed == REQUEST_CONFIG_STATE) {
 			// 能力探测失败时保持现有 UI，不显示原始错误；稍后由进程循环重试。
+			return;
+		}
+		if (completed == REQUEST_MODELS) {
+			// 模型列表失败时保留手动输入回退，不回显 sidecar 原始错误文本。
+			if (codex_model_status && _auth_mode_selected()) {
+				codex_model_status->set_text(_u8("无法获取 Codex 模型列表，请重新登录 ChatGPT 或检查网络。"));
+			}
 			return;
 		}
 		String detail = response.has("detail") ? String(response["detail"]) : response_text;
@@ -504,6 +750,9 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 		case REQUEST_CONFIG_STATE: {
 			config_state_loaded = true;
 			_apply_config_state(response);
+		} break;
+		case REQUEST_MODELS: {
+			_apply_model_catalog(response);
 		} break;
 		case REQUEST_CHATGPT_START: {
 			String login_id = _agent_auth_identifier(response.get("login_id", ""));
@@ -537,6 +786,8 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 			chatgpt_account_label.clear();
 			chatgpt_account_email.clear();
 			chatgpt_plan_enabled = true;
+			models_requested = false;
+			api_models_requested = false;
 #if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 			if (auth_mode) {
 				// 退出后 sidecar 回退 API Key，下拉必须显式同步，避免 UI 仍显示 ChatGPT 而已用 API Key。
@@ -927,6 +1178,12 @@ void AgentWorkspace::_save_settings() {
 	settings->set_setting("vibe_agent/base_url", base_url->get_text().strip_edges());
 	settings->set_setting("vibe_agent/model", model->get_text().strip_edges());
 	settings->set_setting("vibe_agent/vision_model", vision_model->get_text().strip_edges());
+	// Codex 模型单独持久化，绝不写入旧 API 配置键，也不覆盖旧值。
+	String codex_model_id = _codex_model_id();
+	if (codex_model_id.is_empty()) {
+		codex_model_id = String(EDITOR_DEF("vibe_agent/codex_model", "")).strip_edges();
+	}
+	settings->set_setting("vibe_agent/codex_model", codex_model_id);
 	settings->set_setting("vibe_agent/response_language", response_language->get_item_metadata(response_language->get_selected()));
 	settings->save();
 	_push_configuration(true);
@@ -939,11 +1196,16 @@ void AgentWorkspace::_quick_prompt(const String &p_text) {
 
 void AgentWorkspace::_show_settings() {
 	settings_dialog->popup_centered_clamped(Size2(480, 620) * EDSCALE, 0.85);
-	// 打开设置时刷新 sidecar 报告的认证能力/账号状态。
+	// 打开设置时刷新 sidecar 报告的认证能力/账号状态与当前模式模型列表。
+	models_requested = false;
+	api_models_requested = false;
 	_refresh_config_state();
 }
 
 void AgentWorkspace::_on_auth_mode_selected(int p_index) {
+	// 切换模式后按新模式的持久化值重新拉取模型列表；两侧值互不覆盖。
+	models_requested = false;
+	api_models_requested = false;
 	_update_chatgpt_ui();
 	if (p_index == 1 && !_chatgpt_mode_active()) {
 		_set_status(_u8("请先登录 ChatGPT 账号，再保存设置"));
@@ -1069,6 +1331,9 @@ void AgentWorkspace::_handle_chatgpt_status_response(const Dictionary &p_respons
 			auth_mode->select(1);
 		}
 #endif
+		// 登录完成后必须按新账号重新拉取 Codex 模型列表。
+		models_requested = false;
+		api_models_requested = false;
 		_update_chatgpt_ui();
 		_set_status(chatgpt_plan_enabled ? _u8("ChatGPT 账号已登录") : _u8("ChatGPT 账号已登录，但当前账号不具备 Codex 计划能力"));
 		_push_configuration(false);
@@ -1124,6 +1389,11 @@ void AgentWorkspace::_rollback_last_task() {
 }
 
 void AgentWorkspace::_choose_attachments() {
+	// ChatGPT 模式下，所选 Codex 模型没有 image input modality 时明确禁用附件。
+	if (_chatgpt_mode_active() && !codex_image_supported) {
+		_set_status(_u8("当前 Codex 模型不支持图片输入，请在设置中选择支持视觉的模型"), true);
+		return;
+	}
 	attachment_dialog->popup_file_dialog();
 }
 
@@ -1132,6 +1402,10 @@ void AgentWorkspace::_choose_assets() {
 }
 
 void AgentWorkspace::_attachments_selected(const PackedStringArray &p_paths) {
+	if (_chatgpt_mode_active() && !codex_image_supported) {
+		_set_status(_u8("当前 Codex 模型不支持图片输入，请在设置中选择支持视觉的模型"), true);
+		return;
+	}
 	Dictionary body;
 	body["paths"] = p_paths;
 	_request("/v1/attachments", HTTPClient::METHOD_POST, body, REQUEST_ATTACHMENTS);
@@ -1513,6 +1787,8 @@ void AgentWorkspace::_stop_sidecar() {
 	_finish_chatgpt_login();
 	config_state_loaded = false;
 	config_state_retry = 0.0;
+	models_requested = false;
+	api_models_requested = false;
 	if (backend_ready && sidecar_pid != 0 && OS::get_singleton()->is_process_running(sidecar_pid)) {
 		Ref<HTTPClient> shutdown_client = Ref<HTTPClient>(HTTPClient::create());
 		int port = backend_url.get_slice(":", 2).to_int();
@@ -1663,9 +1939,9 @@ AgentWorkspace::AgentWorkspace() {
 
 	HBoxContainer *attachments = memnew(HBoxContainer);
 	chat->add_child(attachments);
-	Button *attach = memnew(Button(_u8("添加参考图片")));
-	attachments->add_child(attach);
-	attach->connect(SceneStringName(pressed), callable_mp(this, &AgentWorkspace::_choose_attachments));
+	attach_button = memnew(Button(_u8("添加参考图片")));
+	attachments->add_child(attach_button);
+	attach_button->connect(SceneStringName(pressed), callable_mp(this, &AgentWorkspace::_choose_attachments));
 	Button *paste = memnew(Button(_u8("粘贴剪贴板图片")));
 	attachments->add_child(paste);
 	paste->connect(SceneStringName(pressed), callable_mp(this, &AgentWorkspace::_paste_clipboard_image));
@@ -1795,14 +2071,6 @@ AgentWorkspace::AgentWorkspace() {
 	settings_grid->set_columns(1);
 	settings_grid->set_h_size_flags(SIZE_EXPAND_FILL);
 	settings_content->add_child(settings_grid);
-	auto add_field = [settings_grid](const String &p_label, LineEdit **r_field) {
-		settings_grid->add_child(memnew(Label(p_label)));
-		*r_field = memnew(LineEdit);
-		(*r_field)->set_h_size_flags(SIZE_EXPAND_FILL);
-		settings_grid->add_child(*r_field);
-	};
-	add_field("API Key", &api_key);
-	api_key->set_secret(true);
 #if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 	// ChatGPT 认证入口在 macOS arm64 与 Windows x86_64 构建中出现：Codex app-server 的
 	// ChatGPT 登录能力随这两个平台的 sidecar 提供，Linux/其他平台继续只使用 API Key。
@@ -1820,9 +2088,33 @@ AgentWorkspace::AgentWorkspace() {
 	settings_grid->add_child(auth_mode);
 	auth_mode->connect(SceneStringName(item_selected), callable_mp(this, &AgentWorkspace::_on_auth_mode_selected));
 #endif
+	// API Key 模式字段整组独立：切到 ChatGPT 模式时隐藏，绝不与 Codex 模型混用。
+	api_section = memnew(VBoxContainer);
+	api_section->set_h_size_flags(SIZE_EXPAND_FILL);
+	settings_content->add_child(api_section);
+	GridContainer *api_grid = memnew(GridContainer);
+	api_grid->set_columns(1);
+	api_grid->set_h_size_flags(SIZE_EXPAND_FILL);
+	api_section->add_child(api_grid);
+	auto add_field = [api_grid](const String &p_label, LineEdit **r_field) {
+		api_grid->add_child(memnew(Label(p_label)));
+		*r_field = memnew(LineEdit);
+		(*r_field)->set_h_size_flags(SIZE_EXPAND_FILL);
+		api_grid->add_child(*r_field);
+	};
+	add_field("API Key", &api_key);
+	api_key->set_secret(true);
 	add_field(_u8("接口地址"), &base_url);
-	add_field(_u8("主模型"), &model);
-	add_field(_u8("视觉模型"), &vision_model);
+	// API 模型来源：优先 models.list；接口不支持时保留明确的手动输入回退。
+	api_grid->add_child(memnew(Label(_u8("API 模型列表"))));
+	api_model_choices = memnew(OptionButton);
+	api_model_choices->set_h_size_flags(SIZE_EXPAND_FILL);
+	api_model_choices->add_item(_u8("当前接口不支持模型列表，请手动输入"));
+	api_model_choices->set_disabled(true);
+	api_grid->add_child(api_model_choices);
+	api_model_choices->connect(SceneStringName(item_selected), callable_mp(this, &AgentWorkspace::_on_api_model_choice_selected));
+	add_field(_u8("API 模型 ID（可手动输入）"), &model);
+	add_field(_u8("视觉模型（API Key 模式）"), &vision_model);
 	base_url->set_text(EDITOR_DEF("vibe_agent/base_url", ""));
 	model->set_text(EDITOR_DEF("vibe_agent/model", "claude-sonnet-4-20250514"));
 	vision_model->set_text(EDITOR_DEF("vibe_agent/vision_model", "gemini-2.5-flash"));
@@ -1849,6 +2141,17 @@ AgentWorkspace::AgentWorkspace() {
 	chatgpt_account_info = memnew(Label());
 	chatgpt_account_info->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	chatgpt_section->add_child(chatgpt_account_info);
+	// Codex 模型只来自 sidecar /v1/models（app-server model/list），任何默认字符串都不兜底。
+	Label *codex_model_label = memnew(Label(_u8("Codex 模型")));
+	chatgpt_section->add_child(codex_model_label);
+	codex_model = memnew(OptionButton);
+	codex_model->set_h_size_flags(SIZE_EXPAND_FILL);
+	codex_model->set_disabled(true);
+	chatgpt_section->add_child(codex_model);
+	codex_model->connect(SceneStringName(item_selected), callable_mp(this, &AgentWorkspace::_on_codex_model_selected));
+	codex_model_status = memnew(Label());
+	codex_model_status->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	chatgpt_section->add_child(codex_model_status);
 	HBoxContainer *chatgpt_actions = memnew(HBoxContainer);
 	chatgpt_section->add_child(chatgpt_actions);
 	chatgpt_login_button = memnew(Button(_u8("登录 ChatGPT")));

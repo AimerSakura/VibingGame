@@ -38,6 +38,50 @@ _RETRY_BASE_DELAY: float = 1.0
 
 SUPPORTED_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 
+#: Maximum accepted model identifier length in the shared catalog contract.
+MAX_MODEL_ID_LENGTH = 200
+
+
+def normalize_api_model_entries(raw_models: Any) -> list[dict[str, Any]]:
+    """Normalize an OpenAI-compatible ``models.list()`` payload.
+
+    Returns the shared editor/sidecar catalog shape:
+
+    * ``id`` — the model identifier (required, bounded, de-duplicated),
+    * ``label`` / ``display_name`` — display text (the id, since the endpoint
+      does not provide a separate display name),
+    * ``supports_image`` — ``None`` (unknown): this endpoint does not advertise
+      input modalities, so the editor must not assume vision support, and
+    * ``is_default`` — ``False`` (the endpoint does not mark a default).
+
+    Never raises: malformed entries are dropped so a broken gateway cannot
+    break the settings dialog.
+    """
+    items: Any = raw_models
+    if not isinstance(items, (list, tuple)):
+        items = getattr(raw_models, "data", None)
+    if not isinstance(items, (list, tuple)):
+        return []
+    entries: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if isinstance(item, dict):
+            model_id = item.get("id")
+        else:
+            model_id = getattr(item, "id", None)
+        if not isinstance(model_id, str):
+            continue
+        model_id = model_id.strip()
+        if not model_id or len(model_id) > MAX_MODEL_ID_LENGTH:
+            continue
+        entries[model_id] = {
+            "id": model_id,
+            "label": model_id,
+            "display_name": model_id,
+            "supports_image": None,
+            "is_default": False,
+        }
+    return [entries[key] for key in sorted(entries, key=str.lower)]
+
 
 # ─── Image Utilities ───
 
@@ -168,6 +212,19 @@ class SimpleLLMProvider:
         except Exception as e:
             self.logger.error("Error listing models: %s", e, exc_info=True)
             return []
+
+    def list_model_catalog(self) -> list[dict[str, Any]]:
+        """List models using the shared catalog contract; never raises.
+
+        An empty list signals that the endpoint does not support listing, so the
+        editor keeps a manual model-entry fallback instead of inventing defaults.
+        """
+        try:
+            models = self.client.models.list()
+        except Exception as e:
+            self.logger.error("Error listing models: %s", e, exc_info=True)
+            return []
+        return normalize_api_model_entries(models)
 
     def add_message(
         self, role: str, prompt: str, chat_history: list[dict[str, Any]], images: list[str] | None = None

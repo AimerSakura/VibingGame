@@ -9,10 +9,13 @@ import unittest
 from pathlib import Path
 
 from vibe_tools import codex_auth
-from vibe_tools.codex_app_server import CodexAppServerError, TurnEvent
+from vibe_tools.codex_app_server import CodexAppServerError, CodexModel, TurnEvent
 from vibe_tools.codex_provider import (
     ERR_ACCOUNT_LOAD_FAILED,
+    ERR_IMAGE_PATH_INVALID,
+    ERR_IMAGE_UNSUPPORTED,
     ERR_INTERRUPTED,
+    ERR_MODELS_UNAVAILABLE,
     ERR_NO_ACCOUNT,
     ERR_REFRESH_FAILED,
     ERR_START_FAILED,
@@ -85,6 +88,9 @@ class FakeAppServer:
         self.resume_raises = False
         self.raise_on_stop = False
         self.events: list = []
+        self.list_models_result: list = []
+        self.list_models_raises: Exception | None = None
+        self.list_models_calls = 0
 
     def start(self) -> None:
         if self.start_raises:
@@ -106,8 +112,14 @@ class FakeAppServer:
             raise CodexAppServerError("raw resume failure " + FAKE_TOKEN)
         return thread_id
 
-    def run_turn(self, thread_id: str, text: str):
-        self.turns.append((thread_id, text))
+    def list_models(self, include_hidden: bool = False):
+        self.list_models_calls += 1
+        if self.list_models_raises is not None:
+            raise self.list_models_raises
+        return list(self.list_models_result)
+
+    def run_turn(self, thread_id: str, text: str, images=None):
+        self.turns.append((thread_id, text, images))
         for event in self.events:
             if event == "WAIT_FOR_INTERRUPT":
                 # A turn is only released by an interrupt that carries a real
@@ -153,6 +165,8 @@ class FakeServerFactory:
         thread_raises: bool = False,
         resume_raises: bool = False,
         raise_on_stop: bool = False,
+        list_models_result=None,
+        list_models_raises: Exception | None = None,
     ) -> None:
         self.instances: list[FakeAppServer] = []
         self.events = events
@@ -163,6 +177,8 @@ class FakeServerFactory:
         self.thread_raises = thread_raises
         self.resume_raises = resume_raises
         self.raise_on_stop = raise_on_stop
+        self.list_models_result = list_models_result
+        self.list_models_raises = list_models_raises
 
     def __call__(self, codex_exe: str, cwd: str, access_token: str, model: str) -> FakeAppServer:
         server = FakeAppServer(codex_exe, cwd, access_token, model)
@@ -176,6 +192,9 @@ class FakeServerFactory:
         server.thread_raises = self.thread_raises
         server.resume_raises = self.resume_raises
         server.raise_on_stop = self.raise_on_stop
+        if self.list_models_result is not None:
+            server.list_models_result = list(self.list_models_result)
+        server.list_models_raises = self.list_models_raises
         self.instances.append(server)
         return server
 
@@ -678,6 +697,161 @@ class CodexProviderTest(unittest.TestCase):
         provider = self.build_provider(accounts={account.account_id: account})
         provider.stop()
         provider.stop()
+
+    # -- model catalog and image input ------------------------------------ #
+
+    def _image_model(self, model_id: str = MODEL, supports_image: bool = True) -> CodexModel:
+        return CodexModel(id=model_id, display_name=model_id, supports_image=supports_image)
+
+    def test_list_models_is_disposable_and_never_starts_a_turn_or_thread(self):
+        account = make_account()
+        factory = FakeServerFactory(
+            events=COMPLETED_EVENTS,
+            list_models_result=[
+                CodexModel(
+                    id="gpt-5.1-codex",
+                    display_name="GPT-5.1 Codex",
+                    supports_image=True,
+                    is_default=True,
+                    supported_reasoning_efforts=("low", "high"),
+                )
+            ],
+        )
+        provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+        catalog = provider.list_models()
+        server = factory.instances[0]
+        self.assertEqual(
+            catalog,
+            [
+                {
+                    "id": "gpt-5.1-codex",
+                    "label": "GPT-5.1 Codex",
+                    "display_name": "GPT-5.1 Codex",
+                    "supports_image": True,
+                    "is_default": True,
+                    "hidden": False,
+                    "supported_reasoning_efforts": ["low", "high"],
+                }
+            ],
+        )
+        self.assertTrue(server.started)
+        self.assertTrue(server.stopped)
+        self.assertEqual(server.start_count, 0)
+        self.assertEqual(server.turns, [])
+        self.assertNotEqual(server.cwd, str(self.project))
+        self.assertNotEqual(server.cwd, str(self.stage))
+        self.assertFalse(Path(server.cwd).exists())
+        # Listing models must never persist a resumable agent thread.
+        self.assertFalse(self.thread_file().exists())
+
+    def test_list_models_safe_error_code_and_no_token(self):
+        account = make_account()
+        factory = FakeServerFactory(
+            list_models_result=[],
+            list_models_raises=CodexAppServerError("raw " + FAKE_TOKEN),
+        )
+        logs: list[str] = []
+        provider = self.build_provider(
+            accounts={account.account_id: account}, server_factory=factory, logs=logs
+        )
+        with self.assertRaises(CodexProviderError) as ctx:
+            provider.list_models()
+        self.assertEqual(str(ctx.exception), ERR_MODELS_UNAVAILABLE)
+        self.assertNotIn(FAKE_TOKEN, str(ctx.exception))
+        self.assertNotIn(FAKE_TOKEN, "\n".join(logs))
+        self.assertTrue(factory.instances[0].stopped)
+
+    def test_run_agent_forwards_validated_stage_images(self):
+        account = make_account()
+        image = self.stage / "shot.png"
+        image.write_bytes(b"fake-png")
+        factory = FakeServerFactory(
+            events=COMPLETED_EVENTS, list_models_result=[self._image_model()]
+        )
+        provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+        reply = provider.run_agent(
+            "look", str(self.stage), self.project, threading.Event(), lambda n, p: None,
+            images=[str(image)],
+        )
+        server = factory.instances[0]
+        self.assertEqual(reply, "ok")
+        self.assertEqual(server.list_models_calls, 1)
+        self.assertEqual(server.turns[0][2], [str(image.resolve())])
+
+    def test_run_agent_does_not_query_models_without_images(self):
+        account = make_account()
+        factory = FakeServerFactory(events=COMPLETED_EVENTS)
+        provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+        provider.run_agent("hi", str(self.stage), self.project, threading.Event(), lambda n, p: None)
+        server = factory.instances[0]
+        self.assertEqual(server.list_models_calls, 0)
+        self.assertEqual(server.turns[0][2], [])
+
+    def test_run_agent_rejects_images_outside_the_stage(self):
+        account = make_account()
+        outside = self.project / "game.gd"
+        factory = FakeServerFactory(
+            events=COMPLETED_EVENTS, list_models_result=[self._image_model()]
+        )
+        provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+        with self.assertRaises(CodexProviderError) as ctx:
+            provider.run_agent(
+                "look", str(self.stage), self.project, threading.Event(), lambda n, p: None,
+                images=[str(outside)],
+            )
+        self.assertEqual(str(ctx.exception), ERR_IMAGE_PATH_INVALID)
+        self.assertEqual(factory.instances, [])
+
+        with self.assertRaises(CodexProviderError) as ctx:
+            provider.run_agent(
+                "look", str(self.stage), self.project, threading.Event(), lambda n, p: None,
+                images=["relative.png"],
+            )
+        self.assertEqual(str(ctx.exception), ERR_IMAGE_PATH_INVALID)
+
+        missing = self.stage / "missing.png"
+        with self.assertRaises(CodexProviderError) as ctx:
+            provider.run_agent(
+                "look", str(self.stage), self.project, threading.Event(), lambda n, p: None,
+                images=[str(missing)],
+            )
+        self.assertEqual(str(ctx.exception), ERR_IMAGE_PATH_INVALID)
+
+    def test_run_agent_rejects_images_for_text_only_model(self):
+        account = make_account()
+        image = self.stage / "shot.png"
+        image.write_bytes(b"fake-png")
+        factory = FakeServerFactory(
+            events=COMPLETED_EVENTS,
+            list_models_result=[self._image_model(supports_image=False)],
+        )
+        provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+        with self.assertRaises(CodexProviderError) as ctx:
+            provider.run_agent(
+                "look", str(self.stage), self.project, threading.Event(), lambda n, p: None,
+                images=[str(image)],
+            )
+        self.assertEqual(str(ctx.exception), ERR_IMAGE_UNSUPPORTED)
+        server = factory.instances[0]
+        self.assertEqual(server.start_count, 0)
+        self.assertEqual(server.turns, [])
+        self.assertTrue(server.stopped)
+
+    def test_run_agent_rejects_images_when_model_is_not_listed(self):
+        account = make_account()
+        image = self.stage / "shot.png"
+        image.write_bytes(b"fake-png")
+        factory = FakeServerFactory(
+            events=COMPLETED_EVENTS,
+            list_models_result=[self._image_model(model_id="some-other-model")],
+        )
+        provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+        with self.assertRaises(CodexProviderError) as ctx:
+            provider.run_agent(
+                "look", str(self.stage), self.project, threading.Event(), lambda n, p: None,
+                images=[str(image)],
+            )
+        self.assertEqual(str(ctx.exception), ERR_IMAGE_UNSUPPORTED)
 
 
 if __name__ == "__main__":

@@ -8,11 +8,11 @@ Agent 对话支持常用 Markdown：标题、粗体、斜体、删除线、行�
 
 运行 `VibeGodot.exe`，在原生项目管理器中打开或新建项目。普通编辑器启动后会自动进入顶部 **Agent** 工作区；项目管理器、无头模式和恢复模式不会启动 Agent 后台。
 
-1. 点击顶部“设置”，在弹窗中填写兼容模型服务的接口地址、主模型、视觉模型和 API Key，点击“保存设置”。API Key 使用当前 Windows 用户的凭据管理器保存，不写入项目、启动参数、环境变量或日志。
+1. 点击顶部“设置”。API Key 模式填写兼容模型服务的接口地址、API 模型、视觉模型和 API Key；ChatGPT/Codex 模式登录后从 Codex 模型列表中选择模型。两组配置按模式分组、互不覆盖，点击“保存设置”。API Key 使用当前 Windows 用户的凭据管理器保存，不写入项目、启动参数、环境变量或日志。
 2. 在“对话”页描述需要创建、修改或检查的内容。执行步骤通过本机 SSE 实时显示；可以取消、重试失败任务、附加参考图片或导入游戏素材。
 3. 参考图片存入 `.godot/agent/attachments`，导入素材存入 `res://assets`。历史只记录附件元数据，不保存大型 Base64 内容。
 4. Agent 在隔离副本中修改项目，再按文件版本和编辑器未保存状态检查后写回。发生冲突会停止写入；“回退上次 Agent 修改”同样检查后续改动，避免覆盖用户工作。
-5. 每次 Agent 实际修改项目文件后，“Tests”页会根据本轮需求和文件差异生成 3～6 项玩家行为测试，运行真实游戏进程，模拟动作、按键、鼠标及场景切换，并检查游戏状态；涉及画面时同时使用已配置的视觉模型。测试失败会自动交回 Agent 修复并复跑全部启用测试，最多回修 3 轮。无文件修改的对话不会触发。
+5. 每次 Agent 实际修改项目文件后，“Tests”页会根据本轮需求和文件差异生成 3～6 项玩家行为测试，运行真实游戏进程，模拟动作、按键、鼠标及场景切换，并检查游戏状态；涉及画面时，API Key 模式使用已配置的视觉模型，ChatGPT/Codex 模式仅在所选 Codex 模型声明图片输入能力时进行视觉判断。测试失败会自动交回 Agent 修复并复跑全部启用测试，最多回修 3 轮。无文件修改的对话不会触发。
 6. “Tests”页显示测试步骤、预期、实际结果和截图，支持单项/全部运行、重新生成、停止，以及展开高级 JSON 编辑计划。计划编辑、手动保存或外部修改会使相应验证过期；单项通过不等于全部通过。测试期间不能编辑计划或导入素材，写回前会重新确认编辑器未保存内容。
 7. 每个用例在独立项目副本、进程和测试存档中运行。脚本检查是前置检查，不代表玩家行为通过；视觉模型不可用、截图失败、测试描述没有可执行步骤或证据不足时显示受阻，不会伪装成通过或直接触发游戏修复。旧版纯文本目标保留为待生成，可在高级编辑中补充步骤或停用。回退上次 Agent 修改会覆盖该任务及其自动回修。
 
@@ -44,10 +44,12 @@ Tests 分别展示行为断言、视觉判断和运行诊断。仅在进程正�
 
 编辑器支持两种模型接入方式，可在顶部“设置”弹窗中切换：
 
-- **API Key 模式**：填写兼容模型服务的接口地址、主模型、视觉模型和 API Key。API Key 由操作系统凭据存储保管：Windows 使用凭据管理器，macOS 使用登录钥匙串（login Keychain）。
-- **ChatGPT / Codex 模式**：无需 OpenAI API Key。点击设置中的 **Sign in with ChatGPT**，按提示在浏览器中打开授权页面并点击 **Continue with ChatGPT** 完成授权；如果账号下有多个可用账号，再按提示选择要使用的账号。
+- **API Key 模式**：填写兼容模型服务的接口地址、API 模型、视觉模型和 API Key。API 模型候选来自该接口的 `models.list`；接口不支持列表时保留“手动输入模型 ID”，不会用默认字符串代替。API Key 由操作系统凭据存储保管：Windows 使用凭据管理器，macOS 使用登录钥匙串（login Keychain）。
+- **ChatGPT / Codex 模式**：无需 OpenAI API Key。点击设置中的 **Sign in with ChatGPT**，按提示在浏览器中打开授权页面并点击 **Continue with ChatGPT** 完成授权；如果账号下有多个可用账号，再按提示选择要使用的账号。登录后从 Codex 的 `model/list` 列出并选择模型，该 id 只用于 Codex，绝不回落到 API 模式模型或 `claude`/`gemini` 默认值。
 
 登录后设置界面会显示账号元数据（账号标识、名称等）。需要时可以切换账号，或退出登录 / 撤销授权；退出或撤销后需重新登录才能继续使用 ChatGPT 模式。
+
+图片与视觉能力：API Key 模式通过接口的 `image_url` 发送图片并可使用单独的视觉模型；ChatGPT/Codex 模式只通过 Codex `turn/start` 的 `localImage` 发送附件，且仅当所选模型声明 `image` input modality 时可用。模型不支持图片时附件入口禁用，侧车也会给出可读的安全错误；附件副本位于工作区副本的忽略目录，不会被当作项目改动写回。API 与 Codex 模型配置分开持久化，切换模式后各自值保留。
 
 OAuth 令牌、访问令牌、刷新令牌和 ID 令牌都不会写入项目文件、启动参数、环境变量、SSE 或日志，只保存在操作系统凭据存储中。界面、日志和文档不会展示任何真实令牌、授权码、Cookie 或授权地址。
 
@@ -74,9 +76,9 @@ $pythonExe = (Get-Command python -CommandType Application).Source
 
 macOS 版本仅支持 arm64（Apple 芯片）。构建并打包后，运行 `.build/VibeGodot-macOS-arm64/VibeGodot.app`，在原生项目管理器中打开或新建项目。普通编辑器启动后会自动进入顶部 **Agent** 工作区；项目管理器、无头模式和恢复模式不会启动 Agent 后台。
 
-1. 点击顶部“设置”，在弹窗中填写兼容模型服务的接口地址、主模型、视觉模型和 API Key，点击“保存设置”。API Key 使用 macOS 钥匙串保存（登录钥匙串中的 `Godot/VibeAgent/api_key` 条目），不写入项目、启动参数、环境变量或日志；接口地址、模型名称和回答语言等非敏感项保存在编辑器设置中。
+1. 点击顶部“设置”。API Key 模式填写兼容模型服务的接口地址、API 模型、视觉模型和 API Key；ChatGPT/Codex 模式登录后从 Codex 模型列表中选择模型，点击“保存设置”。API Key 使用 macOS 钥匙串保存（登录钥匙串中的 `Godot/VibeAgent/api_key` 条目），不写入项目、启动参数、环境变量或日志；接口地址、API 模型、视觉模型、Codex 模型和回答语言等非敏感项保存在编辑器设置中，API 与 Codex 模型键彼此独立。
 2. 对话、参考图片、隔离修改、回退、Tests 与自动回修流程与 Windows 相同，操作步骤与判定规则见上方 Windows 段落。
 
-后台组件随包位于 `VibeGodot.app/Contents/Resources/vibe_agent/godotvibe-agent/godotvibe-agent`（无 `.exe` 后缀，也不是嵌套 `.app`），为 PyInstaller onedir 组件，运行机器无需安装 Python。打包时还会把经过校验、版本固定的 Codex app-server 发布件随 `.app` 一起分发，用于 ChatGPT / Codex 登录；使用者仍需使用完整发布包，不能只复制编辑器可执行文件。每个编辑器实例启动独立 sidecar，监听 `127.0.0.1` 随机端口并使用独立 256 位令牌；编辑器退出时先请求正常关闭，超时后强制清理。诊断日志位于当前项目 `.godot/agent/sidecar.log`。
+后台组件随包位于 `VibeGodot.app/Contents/Resources/vibe_agent/godotvibe-agent/godotvibe-agent`（无 `.exe` 后缀，也不是嵌套 `.app`），为 PyInstaller onedir 组件，运行机器无需安装 Python。打包时还会把经过校验、版本固定的 Codex app-server 发布件随 `.app` 一起分发，用于 ChatGPT / Codex 登录与模型列表；使用者仍需使用完整发布包，不能只复制编辑器可执行文件。每个编辑器实例启动独立 sidecar，监听 `127.0.0.1` 随机端口并使用独立 256 位令牌；编辑器退出时先请求正常关闭，超时后强制清理。诊断日志位于当前项目 `.godot/agent/sidecar.log`。
 
 构建命令：`bash misc/vibe_agent/build_sidecar.sh` 生成 arm64 onedir 后台，`bash misc/vibe_agent/package_macos.sh` 组装 `.build/VibeGodot-macOS-arm64/VibeGodot.app` 与 `.build/VibeGodot-macOS-arm64.zip`。当前产物未签名、未公证，仅支持 arm64；从网络下载后可能被 Gatekeeper 与 quarantine 拦截，确认来源可信后可在“系统设置 → 隐私与安全性”中允许打开，或执行 `xattr -dr com.apple.quarantine <VibeGodot.app>`；是否绕过或允许打开由用户自行决定。

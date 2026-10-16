@@ -65,7 +65,8 @@ class Runtime:
     godot_exe = ""
     token = ""
     loopback_url = ""
-    config = {"response_language": "zh-CN", "base_url": "", "model": "claude-sonnet-4-20250514", "vision_model": "gemini-2.5-flash"}
+    config = {"response_language": "zh-CN", "base_url": "", "model": "claude-sonnet-4-20250514",
+              "vision_model": "gemini-2.5-flash", "codex_model": ""}
     runs: dict[str, dict[str, Any]] = {}
     run_lock = threading.Lock()
     mutex = threading.RLock()
@@ -93,9 +94,12 @@ class Runtime:
 class ConfigureRequest(BaseModel):
     response_language: Literal["zh-CN", "en", "auto"] = "zh-CN"
     api_key: str | None = None
-    base_url: str = ""
-    model: str = "claude-sonnet-4-20250514"
-    vision_model: str = "gemini-2.5-flash"
+    base_url: str | None = None
+    model: str | None = None
+    vision_model: str | None = None
+    #: ChatGPT/Codex model id selected from ``model/list``.  Kept separate from
+    #: ``model`` so switching modes never overwrites the other mode's settings.
+    codex_model: str | None = None
     auth_mode: Literal["api_key", "chatgpt"] | None = None
     chatgpt_account_id: str | None = None
 
@@ -272,20 +276,73 @@ def _store_paths(paths: list[str], as_assets: bool) -> list[dict[str, Any]]:
     return result
 
 
-def _images(attachment_ids: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+def _attachment_items(attachment_ids: list[str]) -> list[dict[str, Any]]:
+    """Return validated attachment metadata (no file bodies are read)."""
     index = _load_attachment_index()
-    images: list[str] = []
     metadata: list[dict[str, Any]] = []
-    for item_id in attachment_ids[:8]:
+    for item_id in (attachment_ids or [])[:8]:
         item = index.get(item_id)
         if not item or item.get("kind") != "attachment":
             raise ValueError("附件不存在或已失效")
         path = (Runtime.project / item["project_path"]).resolve()
         path.relative_to((_agent_dir() / "attachments").resolve())
+        metadata.append(item)
+    return metadata
+
+
+def _encode_images(items: list[dict[str, Any]]) -> list[str]:
+    """Encode attachment metadata as OpenAI-style base64 data URIs (API mode)."""
+    images: list[str] = []
+    source_root = (_agent_dir() / "attachments").resolve()
+    for item in items:
+        path = (Runtime.project / item["project_path"]).resolve()
+        path.relative_to(source_root)
         mime = item.get("mime_type", "image/png")
         images.append(f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}")
-        metadata.append(item)
-    return images, metadata
+    return images
+
+
+def _images(attachment_ids: list[str]) -> tuple[list[str], list[dict[str, Any]]]:
+    items = _attachment_items(attachment_ids)
+    return _encode_images(items), items
+
+
+def _stage_attachment_paths(items: list[dict[str, Any]], stage: Any) -> list[str]:
+    """Copy validated attachments into the workspace stage's ignored tree.
+
+    The copies live under ``<stage>/.godot/agent/attachments`` so Codex can read
+    them as ``localImage`` paths while ``Workspace`` (which ignores ``.godot``)
+    never treats them as project changes.  Every source and destination path is
+    re-checked against its boundary before any copy happens.
+    """
+    if not items:
+        return []
+    source_root = (_agent_dir() / "attachments").resolve()
+    stage_root = Path(str(stage)).resolve()
+    target_root = stage_root / ".godot" / "agent" / "attachments"
+    target_root.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(target_root, 0o700)
+    except OSError:
+        pass
+    paths: list[str] = []
+    for item in items:
+        source = (Runtime.project / item["project_path"]).resolve()
+        source.relative_to(source_root)
+        if not source.is_file():
+            raise ValueError("附件不存在或已失效")
+        name = Path(str(item.get("stored_name") or item["project_path"])).name
+        if not name or name in (".", "..") or "/" in name or "\\" in name:
+            raise ValueError("附件名称无效")
+        target = (target_root / name).resolve()
+        target.relative_to(target_root)
+        shutil.copyfile(source, target)
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+        paths.append(str(target))
+    return paths
 
 
 def _event(name: str, payload: dict[str, Any]) -> bytes:
@@ -362,12 +419,17 @@ def _chatgpt_active() -> bool:
 
 
 def _codex_provider() -> CodexProvider | None:
-    """Build the sidecar's ChatGPT provider, or ``None`` for API Key mode."""
+    """Build the sidecar's ChatGPT provider, or ``None`` for API Key mode.
+
+    The ChatGPT/Codex model comes exclusively from the dedicated
+    ``codex_model`` setting (populated from ``model/list``); the API-Key
+    ``model`` value is never forwarded here.
+    """
     if not _chatgpt_active():
         return None
     provider = CodexProvider(
         codex_exe=Runtime.codex_exe,
-        model=Runtime.config.get("model", ""),
+        model=Runtime.config.get("codex_model", ""),
         account_id=Runtime.chatgpt_account_id,
     )
     with Runtime.mutex:
@@ -383,6 +445,10 @@ def _provider(visual: bool = False):
         codex = _codex_provider()
         if codex is not None:
             return LanguageProvider(codex, Runtime.config.get("response_language", "zh-CN"))
+    elif _chatgpt_active():
+        # ChatGPT/Codex image input must go through the app-server's
+        # turn/start UserInput; never silently fall back to the API Key path.
+        return None
     key = credential("api_key")
     model = Runtime.config.get("vision_model" if visual else "model", "")
     if not key or not model:
@@ -402,6 +468,10 @@ _CODEX_ERROR_MESSAGES = {
     "codex_turn_failed": "Codex 回合失败，请重试。",
     "codex_turn_interrupted": "Codex 回合已取消。",
     "codex_tools_unsupported": "当前模式不支持工具调用。",
+    "chatgpt_model_missing": "请先在设置中选择 Codex 模型。",
+    "chatgpt_models_unavailable": "无法获取 Codex 模型列表，请检查网络或重新登录。",
+    "codex_image_unsupported": "当前 Codex 模型不支持图片输入，请选择支持视觉的模型或移除参考图片。",
+    "codex_image_path_invalid": "参考图片路径无效，请重新添加附件。",
 }
 
 
@@ -559,7 +629,7 @@ def _run_workflow(run: dict[str, Any], request: AgentRequest | HarnessRunRequest
         run["expected_fingerprint"] = project_fingerprint(Runtime.project)
         run["status"] = "running"
         is_agent = isinstance(request, AgentRequest)
-        images, attachments = _images(request.attachment_ids) if is_agent else ([], [])
+        attachments = _attachment_items(request.attachment_ids) if is_agent else []
         harness = AcceptanceHarness(Runtime.project, Runtime.godot_exe, vision=_provider(True))
         import vibe_tools.agent as agent_module
         agent_module.VISION_MODEL = Runtime.config["vision_model"]
@@ -567,12 +637,17 @@ def _run_workflow(run: dict[str, Any], request: AgentRequest | HarnessRunRequest
 
         def modify(prompt):
             nonlocal workspace
+            if workspace is None:
+                workspace = Workspace(Runtime.project, _agent_dir(), run["id"])
             if chatgpt:
-                if workspace is None:
-                    workspace = Workspace(Runtime.project, _agent_dir(), run["id"])
+                if not str(Runtime.config.get("codex_model", "") or "").strip():
+                    raise CodexProviderError("chatgpt_model_missing")
                 provider = _codex_provider()
                 if provider is None:
                     raise CodexProviderError("chatgpt_account_missing")
+                # Codex reads localImage paths; the copies live in the stage's
+                # ignored .godot tree and never reach Workspace.commit.
+                image_paths = _stage_attachment_paths(attachments, workspace.stage)
                 Runtime.app_server_status = "running"
                 Runtime.app_server_account_id = provider.last_account_id
                 try:
@@ -580,7 +655,8 @@ def _run_workflow(run: dict[str, Any], request: AgentRequest | HarnessRunRequest
                     # changes are only written back through _commit_workspace.
                     reply = provider.run_agent(
                         prompt, str(workspace.stage), Runtime.project, run["cancel"],
-                        lambda name, payload: _codex_event(run, name, payload))
+                        lambda name, payload: _codex_event(run, name, payload),
+                        images=image_paths)
                 finally:
                     Runtime.app_server_status = "stopped"
                     Runtime.app_server_account_id = provider.last_account_id
@@ -589,8 +665,7 @@ def _run_workflow(run: dict[str, Any], request: AgentRequest | HarnessRunRequest
             api_key = credential("api_key")
             if not api_key:
                 raise ValueError("请先在 Agent 设置中保存 API Key。")
-            if workspace is None:
-                workspace = Workspace(Runtime.project, _agent_dir(), run["id"])
+            images = _encode_images(attachments)
             generator = GameGenerator(api_key=api_key, base_url=Runtime.config["base_url"] or None,
                 model=Runtime.config["model"], history_file=str(_history_path()),
                 runner=GodotRunner(Runtime.godot_exe or None), cancel_event=run["cancel"], history_key=str(Runtime.project))
@@ -1125,6 +1200,104 @@ def _configure_payload(has_api_key: bool) -> dict[str, Any]:
     return payload
 
 
+# Fixed, credential-free error codes for the model catalog endpoint.
+ERR_API_KEY_MISSING = "api_key_missing"
+ERR_MODEL_LIST_UNAVAILABLE = "model_list_unavailable"
+
+
+def _safe_model_error(error: BaseException) -> str:
+    text = str(error)
+    return text if _SAFE_AUTH_CODE_RE.fullmatch(text) else "chatgpt_models_unavailable"
+
+
+def _model_catalog_entries(models: Any, selected: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if not isinstance(models, (list, tuple)):
+        return entries
+    for model in models:
+        source = model if isinstance(model, dict) else {}
+        model_id = str(source.get("id", "") or "").strip()[:200]
+        if not model_id:
+            continue
+        label = str(source.get("label") or source.get("display_name") or model_id).strip()[:200] or model_id
+        supports_image = source.get("supports_image")
+        raw_efforts = source.get("supported_reasoning_efforts")
+        efforts = [str(value)[:64] for value in raw_efforts if isinstance(value, str)] if isinstance(raw_efforts, (list, tuple)) else []
+        entries.append({
+            "id": model_id,
+            "label": label,
+            "display_name": label,
+            "supports_image": supports_image if isinstance(supports_image, bool) else None,
+            "is_default": bool(source.get("is_default", False)),
+            "hidden": bool(source.get("hidden", False)),
+            "supported_reasoning_efforts": efforts[:16],
+            "selected": model_id == selected,
+        })
+    return entries
+
+
+def _model_payload(mode: str, models: Any, *, manual: bool, error: str | None,
+                   selected: str) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "source": mode,
+        "models": _model_catalog_entries(models, selected),
+        "manual": bool(manual),
+        "error": error,
+        "selected": selected,
+        "protocol_version": PROTOCOL_VERSION,
+    }
+
+
+def _model_catalog_payload() -> dict[str, Any]:
+    """Return the mode-scoped model catalog for the editor settings dialog.
+
+    API-Key mode lists through the OpenAI-compatible models endpoint and keeps
+    an explicit manual fallback.  ChatGPT/Codex mode lists through the bundled
+    app-server ``model/list``; its ids are never mixed with the API-Key model.
+    """
+    supported, _ = _codex_capability()
+    mode = _effective_auth_mode(supported)
+    if mode == "chatgpt":
+        selected = str(Runtime.config.get("codex_model", "") or "")
+        provider = _codex_provider()
+        if provider is None:
+            return _model_payload("chatgpt", [], manual=False,
+                                  error="chatgpt_account_missing", selected=selected)
+        try:
+            models = provider.list_models()
+        except CodexProviderError as error:
+            return _model_payload("chatgpt", [], manual=False,
+                                  error=_safe_model_error(error), selected=selected)
+        except Exception:
+            return _model_payload("chatgpt", [], manual=False,
+                                  error="chatgpt_models_unavailable", selected=selected)
+        return _model_payload("chatgpt", models, manual=False, error=None, selected=selected)
+    selected = str(Runtime.config.get("model", "") or "")
+    try:
+        api_key = credential("api_key")
+    except CredentialError:
+        api_key = ""
+    if not api_key:
+        return _model_payload("api_key", [], manual=True,
+                              error=ERR_API_KEY_MISSING, selected=selected)
+    try:
+        provider = SimpleLLMProvider(api_key=api_key, base_url=Runtime.config.get("base_url") or None,
+                                     model=selected, max_retries=1, request_timeout=45)
+        models = provider.list_model_catalog()
+    except Exception:
+        models = []
+    if not models:
+        return _model_payload("api_key", [], manual=True,
+                              error=ERR_MODEL_LIST_UNAVAILABLE, selected=selected)
+    return _model_payload("api_key", models, manual=False, error=None, selected=selected)
+
+
+@app.get("/v1/models")
+def list_models() -> dict[str, Any]:
+    return _model_catalog_payload()
+
+
 @app.get("/v1/configure")
 def get_configuration() -> dict[str, Any]:
     try:
@@ -1149,7 +1322,14 @@ def configure(request: ConfigureRequest) -> dict[str, Any]:
             credential("api_key", request.api_key)
         except CredentialError as error:
             raise HTTPException(500, str(error)) from error
-    Runtime.config = request.model_dump(exclude={"api_key", "auth_mode", "chatgpt_account_id"})
+    # Merge only the fields the caller actually sent: an API-Key save must
+    # never reset the ChatGPT/Codex model (and vice versa), so the two modes
+    # stay independent and switching modes preserves each side's values.
+    provided = request.model_fields_set
+    updates = request.model_dump(
+        exclude={"api_key", "auth_mode", "chatgpt_account_id"}, exclude_none=True
+    )
+    Runtime.config = {**Runtime.config, **{key: value for key, value in updates.items() if key in provided}}
     if request.auth_mode is not None:
         Runtime.auth_mode = request.auth_mode
     if request.chatgpt_account_id is not None:

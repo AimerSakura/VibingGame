@@ -18,6 +18,7 @@ from vibe_tools.codex_app_server import (
     APP_SERVER_CONFIG,
     CodexAppServer,
     CodexAppServerError,
+    CodexModel,
     TurnEvent,
 )
 
@@ -624,6 +625,241 @@ class TurnIdTest(_ServerTestCase):
         self.assertEqual(server.current_turn_id("t-exit"), "turn-exit")
         server._mark_closed()
         self.assertIsNone(server.current_turn_id("t-exit"))
+
+
+MODEL_LIST_FAKE_SOURCE = r'''#!/usr/bin/env python3
+"""Inline offline app-server that answers model/list."""
+import json
+import os
+import sys
+
+
+def _send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def _record(message):
+    path = os.environ.get("MODEL_LIST_TRANSCRIPT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": "recv", "msg": message}) + "\n")
+
+
+def main():
+    page = os.environ.get("MODEL_LIST_PAGE", "all")
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            message = json.loads(raw)
+        except ValueError:
+            continue
+        _record(message)
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "initialize":
+            _send({"id": request_id, "result": {}})
+        elif method == "initialized":
+            pass
+        elif method == "model/list":
+            params = message.get("params") or {}
+            include_hidden = bool(params.get("includeHidden"))
+            data = [
+                {"id": "gpt-5.1-codex", "model": "gpt-5.1-codex",
+                 "displayName": "GPT-5.1 Codex", "hidden": False, "isDefault": True,
+                 "inputModalities": ["text", "image"],
+                 "supportedReasoningEfforts": [{"effort": "low"}, {"effort": "high"}]},
+                {"id": "gpt-5-codex", "displayName": "GPT-5 Codex", "hidden": True,
+                 "isDefault": False, "inputModalities": ["text"]},
+                {"id": "gpt-legacy", "displayName": "Legacy", "hidden": False,
+                 "isDefault": False, "inputModalities": ["text"]},
+            ]
+            if not include_hidden:
+                data = [item for item in data if not item.get("hidden")]
+            if page == "two" and not params.get("cursor"):
+                _send({"id": request_id, "result": {"data": data[:1], "nextCursor": "page-2"}})
+            elif page == "two" and params.get("cursor") == "page-2":
+                _send({"id": request_id, "result": {"data": data[1:], "nextCursor": None}})
+            else:
+                _send({"id": request_id, "result": {"data": data, "nextCursor": None}})
+        elif request_id is not None:
+            _send({"id": request_id, "result": {}})
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+class ModelListTest(_ServerTestCase):
+    """``model/list`` parsing and request shape, offline."""
+
+    def _inline_server(self, page: str = "all", timeout: float = 5.0) -> CodexAppServer:
+        fake = Path(self.temp.name) / "model_list_fake.py"
+        fake.write_text(MODEL_LIST_FAKE_SOURCE, encoding="utf-8")
+        env = dict(os.environ)
+        env["MODEL_LIST_TRANSCRIPT"] = str(self.transcript)
+        env["MODEL_LIST_PAGE"] = page
+        return CodexAppServer(
+            codex_exe=_launcher(fake, self.temp.name),
+            cwd=self.temp.name,
+            access_token=FAKE_TOKEN,
+            model=FAKE_MODEL,
+            env=env,
+            log=self.logs.append,
+            request_timeout=timeout,
+        )
+
+    def test_models_page_parses_codex_shape(self):
+        payload = {
+            "data": [
+                {
+                    "id": "gpt-5.1-codex",
+                    "model": "gpt-5.1-codex",
+                    "displayName": "GPT-5.1 Codex",
+                    "hidden": False,
+                    "isDefault": True,
+                    "inputModalities": ["text", "image"],
+                    "supportedReasoningEfforts": [{"effort": "low"}, {"effort": "high"}],
+                },
+                {"model": "gpt-no-id", "displayName": "No Id", "inputModalities": ["text"]},
+                {"id": "", "displayName": "Empty"},
+                "not-a-dict",
+            ],
+            "nextCursor": "cursor-1",
+        }
+        models, cursor = CodexAppServer._models_page(payload, include_hidden=False)
+        self.assertEqual(cursor, "cursor-1")
+        self.assertEqual([model.id for model in models], ["gpt-5.1-codex", "gpt-no-id"])
+        self.assertEqual(models[0].display_name, "GPT-5.1 Codex")
+        self.assertTrue(models[0].is_default)
+        self.assertTrue(models[0].supports_image)
+        self.assertEqual(models[0].supported_reasoning_efforts, ("low", "high"))
+        self.assertFalse(models[1].supports_image)
+
+    def test_models_page_filters_hidden_and_unknown_shapes(self):
+        payload = {"data": [{"id": "visible"}, {"id": "hidden", "hidden": True}]}
+        models, cursor = CodexAppServer._models_page(payload, include_hidden=False)
+        self.assertEqual([model.id for model in models], ["visible"])
+        self.assertIsNone(cursor)
+        models, _ = CodexAppServer._models_page(payload, include_hidden=True)
+        self.assertEqual([model.id for model in models], ["visible", "hidden"])
+        # A flat list is accepted; a non-list payload yields nothing.
+        models, cursor = CodexAppServer._models_page([{"id": "flat"}])
+        self.assertEqual([model.id for model in models], ["flat"])
+        self.assertIsNone(cursor)
+        self.assertEqual(CodexAppServer._models_page("nonsense"), ([], None))
+
+    def test_input_modalities_are_required_for_image_support(self):
+        models, _ = CodexAppServer._models_page(
+            {"data": [
+                {"id": "no-modalities"},
+                {"id": "image", "inputModalities": ["text", "IMAGE"]},
+                {"id": "missing-id-modalities", "inputModalities": ["image"]},
+            ]}
+        )
+        self.assertFalse(models[0].supports_image)
+        self.assertTrue(models[1].supports_image)
+        self.assertTrue(models[2].supports_image)
+
+    def test_list_models_sends_model_list_request(self):
+        server = self._inline_server()
+        server.start()
+        try:
+            models = server.list_models()
+        finally:
+            server.stop()
+        self.assertEqual([model.id for model in models], ["gpt-5.1-codex", "gpt-legacy"])
+        requests = [message for message in self._received() if message.get("method") == "model/list"]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["params"]["includeHidden"], False)
+        self._assert_no_token()
+
+    def test_list_models_follows_pagination_cursor(self):
+        server = self._inline_server(page="two")
+        server.start()
+        try:
+            models = server.list_models()
+        finally:
+            server.stop()
+        self.assertEqual([model.id for model in models], ["gpt-5.1-codex", "gpt-legacy"])
+        requests = [message for message in self._received() if message.get("method") == "model/list"]
+        self.assertEqual([request["params"].get("cursor") for request in requests], [None, "page-2"])
+
+    def test_list_models_can_include_hidden(self):
+        server = self._inline_server()
+        server.start()
+        try:
+            models = server.list_models(include_hidden=True)
+        finally:
+            server.stop()
+        self.assertEqual(
+            [model.id for model in models], ["gpt-5.1-codex", "gpt-5-codex", "gpt-legacy"]
+        )
+        requests = [message for message in self._received() if message.get("method") == "model/list"]
+        self.assertEqual(requests[0]["params"]["includeHidden"], True)
+
+
+class ImageInputTest(_ServerTestCase):
+    """Text + ``localImage`` UserInput transport for turn/start."""
+
+    def test_user_input_builds_text_and_local_image_items(self):
+        inputs = CodexAppServer._user_input("look", ["/tmp/a.png", "/tmp/b.png"])
+        self.assertEqual(inputs[0], {"type": "text", "text": "look"})
+        self.assertEqual(
+            inputs[1:],
+            [
+                {"type": "localImage", "path": "/tmp/a.png"},
+                {"type": "localImage", "path": "/tmp/b.png"},
+            ],
+        )
+        self.assertEqual(CodexAppServer._user_input("plain", None), [{"type": "text", "text": "plain"}])
+        self.assertEqual(CodexAppServer._user_input("plain", []), [{"type": "text", "text": "plain"}])
+
+    def test_run_turn_transmits_local_image_paths(self):
+        server = self._server()
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            events = list(server.run_turn(thread_id, "please look", ["/abs/one.png"]))
+            self.assertEqual(events[-1].kind, "turn_completed")
+            starts = [message for message in self._received() if message.get("method") == "turn/start"]
+            self.assertEqual(len(starts), 1)
+            self.assertEqual(
+                starts[0]["params"]["input"],
+                [
+                    {"type": "text", "text": "please look"},
+                    {"type": "localImage", "path": "/abs/one.png"},
+                ],
+            )
+            self._assert_no_token()
+        finally:
+            server.stop()
+
+    def test_run_turn_without_images_keeps_legacy_text_input(self):
+        server = self._server()
+        server.start()
+        try:
+            thread_id = server.start_thread()
+            list(server.run_turn(thread_id, "plain"))
+            starts = [message for message in self._received() if message.get("method") == "turn/start"]
+            self.assertEqual(starts[0]["params"]["input"], [{"type": "text", "text": "plain"}])
+        finally:
+            server.stop()
+
+
+class CodexModelTest(unittest.TestCase):
+    def test_defaults(self):
+        model = CodexModel(id="gpt-5.1-codex", display_name="GPT-5.1 Codex")
+        self.assertEqual(model.id, "gpt-5.1-codex")
+        self.assertEqual(model.display_name, "GPT-5.1 Codex")
+        self.assertFalse(model.supports_image)
+        self.assertFalse(model.is_default)
+        self.assertFalse(model.hidden)
+        self.assertEqual(model.supported_reasoning_efforts, ())
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -38,6 +38,34 @@ def _reset_auth_state() -> None:
     Runtime.codex_version = ""
 
 
+def _default_config() -> dict:
+    return {
+        "response_language": "zh-CN",
+        "base_url": "",
+        "model": "claude-sonnet-4-20250514",
+        "vision_model": "gemini-2.5-flash",
+        "codex_model": "",
+    }
+
+
+class _FakeCatalogProvider:
+    """Offline stand-in for ``SimpleLLMProvider`` model listing."""
+
+    catalog: list = []
+    error: Exception | None = None
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+    def list_model_catalog(self):
+        if type(self).error is not None:
+            raise type(self).error
+        return list(type(self).catalog)
+
+    def list_models(self):
+        return [entry["id"] for entry in self.list_model_catalog()]
+
+
 class EditorSidecarTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -49,6 +77,7 @@ class EditorSidecarTest(unittest.TestCase):
         Runtime.parent_pid = 123
         Runtime.godot_exe = ""
         Runtime.runs = {}
+        Runtime.config = _default_config()
         _reset_auth_state()
         self.client = TestClient(app)
         self.headers = {"Authorization": "Bearer sidecar-token"}
@@ -220,6 +249,87 @@ class EditorSidecarTest(unittest.TestCase):
             Runtime.run_lock.release()
         self.assertEqual(response.status_code, 409)
 
+    # -- model-mode isolation and model catalog --------------------------- #
+
+    def test_configure_keeps_api_and_codex_models_independent(self):
+        first = self.client.post("/v1/configure", headers=self.headers, json={
+            "model": "api-model-1", "vision_model": "api-vision-1", "codex_model": "codex-model-1"})
+        self.assertEqual(first.status_code, 200, first.text)
+        second = self.client.post("/v1/configure", headers=self.headers, json={
+            "model": "api-model-2", "codex_model": "codex-model-2"})
+        self.assertEqual(second.status_code, 200, second.text)
+        self.assertEqual(Runtime.config["model"], "api-model-2")
+        self.assertEqual(Runtime.config["vision_model"], "api-vision-1")
+        self.assertEqual(Runtime.config["codex_model"], "codex-model-2")
+        body = self.client.get("/v1/configure", headers=self.headers).json()
+        self.assertEqual(body["model"], "api-model-2")
+        self.assertEqual(body["vision_model"], "api-vision-1")
+        self.assertEqual(body["codex_model"], "codex-model-2")
+
+    def test_configure_partial_update_preserves_the_other_mode(self):
+        self.client.post("/v1/configure", headers=self.headers, json={
+            "model": "api-keep", "codex_model": "codex-keep", "base_url": "http://keep"})
+        self.client.post("/v1/configure", headers=self.headers, json={"codex_model": "codex-new"})
+        self.assertEqual(Runtime.config["model"], "api-keep")
+        self.assertEqual(Runtime.config["base_url"], "http://keep")
+        self.assertEqual(Runtime.config["codex_model"], "codex-new")
+        self.client.post("/v1/configure", headers=self.headers, json={"model": "api-new"})
+        self.assertEqual(Runtime.config["codex_model"], "codex-new")
+
+    def test_get_configure_exposes_codex_model_field_by_default(self):
+        body = self.client.get("/v1/configure", headers=self.headers).json()
+        self.assertIn("codex_model", body)
+        self.assertEqual(body["codex_model"], "")
+        self.assertEqual(body["model"], "claude-sonnet-4-20250514")
+        self.assertEqual(body["vision_model"], "gemini-2.5-flash")
+
+    def test_models_endpoint_api_mode_requires_key_and_falls_back_to_manual(self):
+        response = self.client.get("/v1/models", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["mode"], "api_key")
+        self.assertEqual(body["models"], [])
+        self.assertTrue(body["manual"])
+        self.assertEqual(body["error"], "api_key_missing")
+        self.assertEqual(body["protocol_version"], 1)
+
+    def test_models_endpoint_api_mode_lists_models(self):
+        _FakeCatalogProvider.catalog = [{
+            "id": "gpt-4o", "label": "gpt-4o", "display_name": "gpt-4o",
+            "supports_image": None, "is_default": False,
+        }]
+        _FakeCatalogProvider.error = None
+        try:
+            with patch.object(sidecar_module, "credential", return_value="test-key"), \
+                 patch.object(sidecar_module, "SimpleLLMProvider", _FakeCatalogProvider):
+                response = self.client.get("/v1/models", headers=self.headers)
+        finally:
+            _FakeCatalogProvider.catalog = []
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["mode"], "api_key")
+        self.assertFalse(body["manual"])
+        self.assertIsNone(body["error"])
+        self.assertEqual([entry["id"] for entry in body["models"]], ["gpt-4o"])
+        self.assertFalse(body["models"][0]["selected"])
+
+    def test_models_endpoint_api_mode_empty_list_is_manual(self):
+        _FakeCatalogProvider.catalog = []
+        _FakeCatalogProvider.error = None
+        try:
+            with patch.object(sidecar_module, "credential", return_value="test-key"), \
+                 patch.object(sidecar_module, "SimpleLLMProvider", _FakeCatalogProvider):
+                response = self.client.get("/v1/models", headers=self.headers)
+        finally:
+            _FakeCatalogProvider.catalog = []
+        body = response.json()
+        self.assertEqual(body["models"], [])
+        self.assertTrue(body["manual"])
+        self.assertEqual(body["error"], "model_list_unavailable")
+
+    def test_models_endpoint_requires_bearer_token(self):
+        self.assertEqual(self.client.get("/v1/models").status_code, 401)
+
 
 class _FakeLoopback:
     """Offline stand-in for ``codex_auth.LoopbackCallback``."""
@@ -331,6 +441,7 @@ class ChatGptAuthTest(unittest.TestCase):
         Runtime.parent_pid = 123
         Runtime.godot_exe = ""
         Runtime.runs = {}
+        Runtime.config = _default_config()
         _reset_auth_state()
         self.client = TestClient(app)
         self.headers = {"Authorization": "Bearer sidecar-token"}
@@ -532,6 +643,65 @@ class ChatGptAuthTest(unittest.TestCase):
             run.return_value = subprocess.CompletedProcess([], 1, stdout=b"", stderr=b"creds")
             self.assertEqual(sidecar_module._codex_version("/fake/codex"), "")
         self.assertEqual(sidecar_module._codex_version(""), "")
+
+    # -- model catalog ---------------------------------------------------- #
+
+    def test_models_endpoint_chatgpt_uses_provider_catalog(self):
+        self._enable_chatgpt()
+        Runtime.auth_mode = "chatgpt"
+        Runtime.chatgpt_account_id = "acct-1"
+        Runtime.config["codex_model"] = "gpt-5.1-codex"
+
+        class FakeProvider:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def list_models(self):
+                return [{
+                    "id": "gpt-5.1-codex", "label": "GPT-5.1 Codex",
+                    "display_name": "GPT-5.1 Codex", "supports_image": True,
+                    "is_default": True, "hidden": False,
+                    "supported_reasoning_efforts": ["low"],
+                }]
+
+            def stop(self):
+                pass
+
+        with patch.object(sidecar_module.sys, "platform", "darwin"), \
+             patch.object(sidecar_module, "CodexProvider", FakeProvider):
+            response = self.client.get("/v1/models", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["mode"], "chatgpt")
+        self.assertFalse(body["manual"])
+        self.assertIsNone(body["error"])
+        self.assertEqual([entry["id"] for entry in body["models"]], ["gpt-5.1-codex"])
+        self.assertTrue(body["models"][0]["supports_image"])
+        self.assertTrue(body["models"][0]["is_default"])
+        self.assertTrue(body["models"][0]["selected"])
+
+    def test_models_endpoint_chatgpt_reports_safe_error_code(self):
+        self._enable_chatgpt()
+        Runtime.auth_mode = "chatgpt"
+
+        class FailingProvider:
+            def __init__(self, **kwargs):
+                pass
+
+            def list_models(self):
+                raise sidecar_module.CodexProviderError("chatgpt_account_missing")
+
+            def stop(self):
+                pass
+
+        with patch.object(sidecar_module.sys, "platform", "darwin"), \
+             patch.object(sidecar_module, "CodexProvider", FailingProvider):
+            response = self.client.get("/v1/models", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["mode"], "chatgpt")
+        self.assertEqual(body["error"], "chatgpt_account_missing")
+        self.assertEqual(body["models"], [])
 
     # -- authentication --------------------------------------------------- #
 
@@ -939,10 +1109,12 @@ class _FakeCodexProvider:
         self.live_at_run: str | None = None
         type(self).instances.append(self)
 
-    def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event):
+    def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event, images=None):
         self.runs.append({
             "prompt": prompt, "stage": str(workspace_stage),
             "project_root": str(project_root), "cancel": cancel_event,
+            "images": list(images or []),
+            "images_exist": [Path(p).is_file() for p in (images or [])],
         })
         self.live_at_run = (Path(project_root) / "game.gd").read_text(encoding="utf-8")
         stage = Path(workspace_stage)
@@ -953,6 +1125,9 @@ class _FakeCodexProvider:
         on_event("file_change", {"path": "res://game.gd"})
         on_event("turn_completed", {"status": "completed"})
         return "work done"
+
+    def list_models(self):
+        return []
 
     def stop(self):
         self.stopped = True
@@ -976,7 +1151,7 @@ class ChatGptProviderWiringTest(unittest.TestCase):
         Runtime.godot_exe = sys.executable
         Runtime.runs = {}
         Runtime.config = {"response_language": "zh-CN", "base_url": "", "model": "gpt-5-codex",
-                          "vision_model": "gemini-2.5-flash"}
+                          "vision_model": "gemini-2.5-flash", "codex_model": "gpt-5-codex"}
         _reset_auth_state()
         Runtime.auth_mode = "chatgpt"
         Runtime.codex_exe = "/opt/fake-codex"
@@ -1043,7 +1218,7 @@ class ChatGptProviderWiringTest(unittest.TestCase):
 
     def test_chatgpt_run_stream_maps_cancel_and_safe_errors(self):
         class CancellingProvider(_FakeCodexProvider):
-            def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event):
+            def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event, images=None):
                 cancel_event.set()
                 raise sidecar_module.CodexProviderError("codex_turn_interrupted")
 
@@ -1062,7 +1237,7 @@ class ChatGptProviderWiringTest(unittest.TestCase):
         self.assertFalse(Runtime.run_lock.locked())
 
         class MissingAccountProvider(_FakeCodexProvider):
-            def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event):
+            def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event, images=None):
                 raise sidecar_module.CodexProviderError("chatgpt_account_missing")
 
         with patch.object(sidecar_module, "CodexProvider", MissingAccountProvider), \
@@ -1077,6 +1252,77 @@ class ChatGptProviderWiringTest(unittest.TestCase):
         self.assertIn("请先登录 ChatGPT 账号", body)
         self.assertNotIn("chatgpt_account_missing", body)
         self.assertFalse(Runtime.run_lock.locked())
+
+    def test_chatgpt_run_stream_stages_attachment_inside_workspace(self):
+        image = Path(self.temp.name) / "shot.png"
+        image.write_bytes(b"fake-png")
+        added = self.client.post("/v1/attachments", headers=self.headers, json={"paths": [str(image)]})
+        self.assertEqual(added.status_code, 200, added.text)
+        attachment_id = added.json()["attachments"][0]["id"]
+
+        with patch.object(sidecar_module, "CodexProvider", _FakeCodexProvider), \
+             patch.object(sidecar_module, "_generate_plan"), \
+             patch.object(sidecar_module, "_repair_cycle", return_value=None):
+            with self.client.stream(
+                "POST", "/v1/agent/run-stream", headers=self.headers,
+                json={"prompt": "look at this", "editor_sync": False,
+                      "attachment_ids": [attachment_id]},
+            ) as response:
+                body = "".join(response.iter_text())
+
+        self.assertEqual(response.status_code, 200, body)
+        provider = _FakeCodexProvider.instances[-1]
+        run_info = provider.runs[0]
+        images = run_info["images"]
+        self.assertEqual(len(images), 1)
+        stage = Path(run_info["stage"]).resolve()
+        staged = Path(images[0]).resolve()
+        # The local image handed to Codex lives in the stage's ignored .godot
+        # tree, so it is never committed as a project change.
+        staged.relative_to(stage)
+        self.assertEqual(staged.parts[-4:-1], (".godot", "agent", "attachments"))
+        # The copied image existed (and was readable) while the turn ran; the
+        # disposable stage is removed afterwards.
+        self.assertEqual(run_info["images_exist"], [True])
+        self.assertIn('"changed_files": ["game.gd"]', body)
+        self.assertNotIn(".godot/agent/attachments", body)
+
+    def test_chatgpt_run_stream_maps_image_errors_to_readable_text(self):
+        image = Path(self.temp.name) / "shot.png"
+        image.write_bytes(b"fake-png")
+        added = self.client.post("/v1/attachments", headers=self.headers, json={"paths": [str(image)]})
+        attachment_id = added.json()["attachments"][0]["id"]
+
+        class ImageUnsupportedProvider(_FakeCodexProvider):
+            def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event, images=None):
+                raise sidecar_module.CodexProviderError("codex_image_unsupported")
+
+        with patch.object(sidecar_module, "CodexProvider", ImageUnsupportedProvider), \
+             patch.object(sidecar_module, "_generate_plan"), \
+             patch.object(sidecar_module, "_repair_cycle", return_value=None):
+            with self.client.stream(
+                "POST", "/v1/agent/run-stream", headers=self.headers,
+                json={"prompt": "look at this", "editor_sync": False,
+                      "attachment_ids": [attachment_id]},
+            ) as response:
+                body = "".join(response.iter_text())
+        self.assertIn("event: error", body)
+        self.assertIn("不支持图片", body)
+        self.assertNotIn("codex_image_unsupported", body)
+
+    def test_chatgpt_run_stream_requires_a_codex_model(self):
+        Runtime.config["codex_model"] = ""
+        with patch.object(sidecar_module, "CodexProvider", _FakeCodexProvider), \
+             patch.object(sidecar_module, "_generate_plan"), \
+             patch.object(sidecar_module, "_repair_cycle", return_value=None):
+            with self.client.stream(
+                "POST", "/v1/agent/run-stream", headers=self.headers,
+                json={"prompt": "fix jump", "editor_sync": False},
+            ) as response:
+                body = "".join(response.iter_text())
+        self.assertIn("event: error", body)
+        self.assertIn("选择 Codex 模型", body)
+        self.assertNotIn("chatgpt_model_missing", body)
 
     def test_stream_joins_worker_before_returning(self):
         """The stream generator must not return while its worker is running."""

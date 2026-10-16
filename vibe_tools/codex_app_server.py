@@ -51,6 +51,9 @@ APP_SERVER_CONFIG: tuple[str, ...] = (
 DEFAULT_REQUEST_TIMEOUT = 30.0
 DEFAULT_TERMINATE_TIMEOUT = 3.0
 
+#: Hard cap on ``model/list`` pagination so a misbehaving server cannot loop.
+_MAX_MODEL_PAGES = 10
+
 _TERMINAL_NOTIFICATIONS = frozenset({"turn/completed", "error", "turn/failed"})
 _CLOSED = object()
 
@@ -68,6 +71,23 @@ class TurnEvent:
     item_id: str | None = None
     status: str | None = None
     message: str | None = None
+
+
+@dataclass(frozen=True)
+class CodexModel:
+    """One entry from the app-server ``model/list`` catalog.
+
+    Only non-sensitive metadata is retained: the model id used for
+    ``thread/start``, a display name, the advertised input modalities and the
+    reasoning efforts.  Nothing here is a credential.
+    """
+
+    id: str
+    display_name: str
+    supports_image: bool = False
+    is_default: bool = False
+    hidden: bool = False
+    supported_reasoning_efforts: tuple[str, ...] = ()
 
 
 class _Pending:
@@ -313,7 +333,7 @@ class CodexAppServer:
         result = self._request("thread/resume", params)
         return self._thread_id_from(result) or thread_id
 
-    def run_turn(self, thread_id: str, text: str) -> Iterator[TurnEvent]:
+    def run_turn(self, thread_id: str, text: str, images: list[str] | None = None) -> Iterator[TurnEvent]:
         self._ensure_alive()
         turn_queue: "queue.Queue" = queue.Queue()
         with self._turn_lock:
@@ -325,7 +345,7 @@ class CodexAppServer:
         try:
             result = self._request(
                 "turn/start",
-                {"threadId": thread_id, "input": [{"type": "text", "text": text}]},
+                {"threadId": thread_id, "input": self._user_input(text, images)},
             )
             # Prefer the synchronous turn/start response; a turn/started
             # notification handled by the reader thread may already have
@@ -369,6 +389,125 @@ class CodexAppServer:
         if not turn_id:
             raise CodexAppServerError(f"no active turn recorded for thread {thread_id}")
         self._request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+
+    def list_models(self, *, include_hidden: bool = False) -> list[CodexModel]:
+        """Return the ``model/list`` catalog.
+
+        This is a read-only request: it never starts a thread, never starts a
+        turn and never persists a ``thread.json``.  Pagination is followed for a
+        bounded number of pages.
+        """
+        self._ensure_alive()
+        models: list[CodexModel] = []
+        cursor: str | None = None
+        for _ in range(_MAX_MODEL_PAGES):
+            params: dict[str, Any] = {"includeHidden": bool(include_hidden)}
+            if cursor:
+                params["cursor"] = cursor
+            result = self._request("model/list", params)
+            page, cursor = self._models_page(result, include_hidden=include_hidden)
+            models.extend(page)
+            if not cursor:
+                break
+        return models
+
+    # ------------------------------------------------------------------
+    # UserInput helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _user_input(text: str, images: list[str] | None = None) -> list[dict[str, Any]]:
+        """Build the ``turn/start`` UserInput list (text + local images).
+
+        Image paths are only serialized here; boundary validation is the
+        caller's responsibility (``CodexProvider`` confines them to the staging
+        directory before they reach this method).
+        """
+        inputs: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        for path in images or ():
+            if isinstance(path, str) and path:
+                inputs.append({"type": "localImage", "path": path})
+        return inputs
+
+    @classmethod
+    def _models_page(
+        cls, payload: Any, *, include_hidden: bool = False
+    ) -> tuple[list[CodexModel], str | None]:
+        """Parse one ``model/list`` result into models plus a next cursor."""
+        items: Any
+        cursor: Any
+        if isinstance(payload, list):
+            items, cursor = payload, None
+        elif isinstance(payload, dict):
+            items = payload.get("data")
+            cursor = payload.get("nextCursor")
+        else:
+            return [], None
+        if not isinstance(items, list):
+            items = []
+        if not isinstance(cursor, str) or not cursor:
+            cursor = None
+        models: list[CodexModel] = []
+        for item in items:
+            model = cls._model_from(item)
+            if model is None:
+                continue
+            if model.hidden and not include_hidden:
+                continue
+            models.append(model)
+        return models, cursor
+
+    @classmethod
+    def _model_from(cls, item: Any) -> CodexModel | None:
+        if not isinstance(item, dict):
+            return None
+        model_id = item.get("id") or item.get("model")
+        if not isinstance(model_id, str) or not model_id.strip():
+            return None
+        model_id = model_id.strip()[:200]
+        display = item.get("displayName") or item.get("display_name")
+        if not isinstance(display, str) or not display.strip():
+            display = model_id
+        modalities = cls._input_modalities(item)
+        return CodexModel(
+            id=model_id,
+            display_name=display.strip()[:200],
+            supports_image="image" in modalities,
+            is_default=bool(item.get("isDefault") or item.get("is_default")),
+            hidden=bool(item.get("hidden")),
+            supported_reasoning_efforts=cls._reasoning_efforts(item),
+        )
+
+    @staticmethod
+    def _input_modalities(item: dict) -> tuple[str, ...]:
+        raw = item.get("inputModalities")
+        if raw is None:
+            raw = item.get("input_modalities")
+        if not isinstance(raw, (list, tuple)):
+            return ()
+        return tuple(
+            value.strip().lower()
+            for value in raw
+            if isinstance(value, str) and value.strip()
+        )
+
+    @staticmethod
+    def _reasoning_efforts(item: dict) -> tuple[str, ...]:
+        raw = item.get("supportedReasoningEfforts")
+        if raw is None:
+            raw = item.get("supported_reasoning_efforts")
+        if not isinstance(raw, (list, tuple)):
+            return ()
+        efforts: list[str] = []
+        for entry in raw:
+            if isinstance(entry, str):
+                value = entry
+            elif isinstance(entry, dict):
+                value = entry.get("effort")
+            else:
+                value = None
+            if isinstance(value, str) and value.strip():
+                efforts.append(value.strip()[:64])
+        return tuple(efforts)
 
     # ------------------------------------------------------------------
     # reader threads

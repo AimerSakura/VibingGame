@@ -10,7 +10,7 @@
 | --- | --- |
 | 原生 Agent 工作区 | 多轮对话、历史记录、工具执行进度、取消及失败重试 |
 | Markdown 回答 | 支持标题、表格、粗体、列表、行内代码与代码块等常用格式 |
-| 模型与语言设置 | 顶部“设置”按钮打开弹窗，可配置主模型、视觉模型及回答语言；支持简体中文、English、跟随用户输入 |
+| 模型与语言设置 | 顶部“设置”按钮打开弹窗，按认证模式分组：API Key 模式配置接口地址、API 模型、视觉模型；ChatGPT/Codex 模式从 Codex 模型列表选择，两组配置互不覆盖 |
 | 图片与素材 | 添加参考图片、拖放、粘贴剪贴板图片，以及导入游戏素材 |
 | 隔离修改与回退 | 在项目副本中执行修改，写回前检查磁盘版本与编辑器未保存状态；支持整轮 Agent 修改回退 |
 | Tests 自动验收 | 根据用户需求和实际文件差异生成测试点，执行真实 Godot 输入、状态断言、截图和视觉判断 |
@@ -23,12 +23,12 @@ Agent 工作区中的对话和 Tests 使用完整宽度，设置不再占用常�
 GitHub 仓库和“Download ZIP”提供的是源码，不包含编译好的 `.exe`。如果没有完整 Windows 发布包，请先按下方 [Windows 构建](#windows-构建) 编译并打包，再执行以下步骤。
 
 1. 打开完整 Windows 发布包中的 `VibeGodot.exe`，通过项目管理器新建或打开项目。请保留同目录的 `vibe_agent` 等依赖文件，不要只复制编辑器 EXE。
-2. 进入顶部 **Agent** 工作区，点击 **设置**，填写兼容模型服务的接口地址、主模型、视觉模型和 API Key。
-3. 选择回答语言并点击 **保存设置**。默认使用简体中文，已有历史不会自动翻译。视觉验收需要支持图片输入的模型与接口。
+2. 进入顶部 **Agent** 工作区，点击 **设置**。API Key 模式填写兼容模型服务的接口地址、API 模型、视觉模型和 API Key；ChatGPT/Codex 模式登录后从 Codex 模型列表中选择模型。
+3. 选择回答语言并点击 **保存设置**。默认使用简体中文，已有历史不会自动翻译。API Key 模式的视觉验收使用单独的视觉模型；ChatGPT/Codex 模式只使用所选 Codex 模型声明的图片输入能力。
 4. 在 **对话** 页描述任务，例如“增加玩家死亡后的复活倒计时，倒计时结束前禁用复活按钮”。
 5. Agent 修改文件后，在 **Tests** 页查看测试步骤、实际状态、截图及最终结论。需要时可手动运行、重新生成或停止测试。
 
-API Key 使用 Windows 凭据管理器保存；模型地址、名称和回答语言保存在编辑器设置中。“清空当前项目对话”和“回退上次 Agent 修改”也位于设置弹窗内。
+API Key 使用 Windows 凭据管理器保存；接口地址、API 模型、视觉模型、Codex 模型和回答语言保存在编辑器设置中，其中旧的 `vibe_agent/model` 与 `vibe_agent/vision_model` 只作为 API Key 模式的值，Codex 模型单独保存，切换模式时各自保留。“清空当前项目对话”和“回退上次 Agent 修改”也位于设置弹窗内。
 
 发布包的使用者无需安装 Python。模型请求会发送到你配置的服务；代码上下文、需求及视觉测试截图可能作为请求内容发送。
 
@@ -38,12 +38,14 @@ Agent 支持两种模型接入方式，可在顶部 **设置** 弹窗中切换�
 
 | 方式 | 适用平台 | 说明 |
 | --- | --- | --- |
-| API Key | Windows 与 macOS | 填写兼容模型服务的接口地址、主模型、视觉模型和 API Key |
-| ChatGPT / Codex | Windows x86_64 与 macOS arm64（Apple 芯片） | 不需要 OpenAI API Key，使用 ChatGPT 账号登录 |
+| API Key | Windows 与 macOS | 填写兼容模型服务的接口地址、API 模型、视觉模型和 API Key；模型列表来自该接口的 `models.list`，不支持时手动输入 |
+| ChatGPT / Codex | Windows x86_64 与 macOS arm64（Apple 芯片） | 不需要 OpenAI API Key，使用 ChatGPT 账号登录；模型列表来自随包 Codex 的 `model/list`，图片输入按所选模型的 image modality 决定 |
 
-**API Key 模式**：在“设置”中填写接口地址、模型名称和 API Key 后保存。API Key 由操作系统凭据存储保管（Windows 凭据管理器；macOS 登录钥匙串），不写入项目、启动参数、环境变量、SSE 或日志。
+**API Key 模式**：在“设置”中填写接口地址、模型名称和 API Key 后保存。侧车用该接口的 `models.list` 填充 API 模型候选；接口不支持列表时保留“手动输入模型 ID”，不会用任何默认字符串代替。API Key 由操作系统凭据存储保管（Windows 凭据管理器；macOS 登录钥匙串），不写入项目、启动参数、环境变量、SSE 或日志。视觉验收使用单独配置的“视觉模型”。
 
-**ChatGPT / Codex 模式**：点击 **Sign in with ChatGPT**，在浏览器中完成授权；如果账号下包含多个可用账号，再按提示选择要使用的账号。登录后设置界面会显示账号元数据（如账号标识与名称）。需要时可以切换账号，或退出登录 / 撤销授权；退出或撤销后需重新登录才能继续使用该模式。该模式不需要 OpenAI API Key。
+**ChatGPT / Codex 模式**：点击 **Sign in with ChatGPT**，在浏览器中完成授权；如果账号下包含多个可用账号，再按提示选择要使用的账号。登录后设置界面会显示账号元数据（如账号标识与名称），并从 Codex 的 `model/list` 列出可用模型；该模型 id 只用于 Codex，绝不会回落到 API 模式的主模型或 `claude`/`gemini` 默认值。需要时可以切换账号，或退出登录 / 撤销授权；退出或撤销后需重新登录才能继续使用该模式。该模式不需要 OpenAI API Key。
+
+**图片与视觉能力**：API Key 模式通过接口的 `image_url` 通道发送图片；ChatGPT/Codex 模式只通过 Codex `turn/start` 的 `localImage` 发送附件，且仅当所选模型的 `inputModalities` 含 `image` 时可用。模型不支持图片时，“添加参考图片”、拖放与剪贴板入口会被禁用；即使绕过界面，侧车也会返回可读的安全错误。附件副本位于工作区副本的忽略目录，不会被当作项目改动写回。
 
 无论使用哪种模式，OAuth、访问令牌、刷新令牌和 ID 令牌都不会写入项目文件、命令行参数、环境变量、SSE 事件或日志，仅保存在操作系统凭据存储中（Windows 凭据管理器、macOS 登录钥匙串）。界面、日志和文档不会展示任何真实令牌、授权码、Cookie 或授权地址。
 
@@ -217,7 +219,7 @@ bash misc/vibe_agent/package_macos.sh
 open .build/VibeGodot-macOS-arm64/VibeGodot.app
 ```
 
-API Key 保存在 macOS 登录钥匙串的 `Godot/VibeAgent/api_key` 条目中，不写入项目、启动参数、环境变量或日志；模型地址、名称、视觉模型和回答语言等非敏感项保存在编辑器设置（Editor Settings）中。打包时会把经过校验、版本固定的 Codex app-server 发布件随 `.app` 一起分发，供 **Sign in with ChatGPT** 登录使用；使用者仍需使用完整发布包，分发时需要保留 `.app` 内的全部文件，目标机器无需安装 Python。
+API Key 保存在 macOS 登录钥匙串的 `Godot/VibeAgent/api_key` 条目中，不写入项目、启动参数、环境变量或日志；接口地址、API 模型、视觉模型、Codex 模型和回答语言等非敏感项保存在编辑器设置（Editor Settings）中，API 与 Codex 模型键彼此独立。打包时会把经过校验、版本固定的 Codex app-server 发布件随 `.app` 一起分发，供 **Sign in with ChatGPT** 登录与模型列表使用；使用者仍需使用完整发布包，分发时需要保留 `.app` 内的全部文件，目标机器无需安装 Python。
 
 > **未签名 / 未公证**：当前发布包不包含代码签名和公证，仅支持 arm64。从网络下载后 macOS Gatekeeper 可能阻止打开并标记 quarantine；确认来源可信后，可在“系统设置 → 隐私与安全性”中选择仍要打开，或执行 `xattr -dr com.apple.quarantine <VibeGodot.app>`。是否绕过或允许打开由用户自行决定。
 

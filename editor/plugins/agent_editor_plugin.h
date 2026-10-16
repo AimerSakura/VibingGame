@@ -39,6 +39,7 @@ class AgentWorkspace : public VBoxContainer {
 		REQUEST_HARNESS_SAVE,
 		REQUEST_ROLLBACK,
 		REQUEST_CONFIG_STATE,
+		REQUEST_MODELS,
 		REQUEST_CHATGPT_START,
 		REQUEST_CHATGPT_STATUS,
 		REQUEST_CHATGPT_CANCEL,
@@ -70,9 +71,21 @@ class AgentWorkspace : public VBoxContainer {
 	LineEdit *base_url = nullptr;
 	LineEdit *model = nullptr;
 	LineEdit *vision_model = nullptr;
+	// API Key 模式字段独立分组，切到 ChatGPT 模式时整组隐藏，绝不与 Codex 模型混用。
+	VBoxContainer *api_section = nullptr;
+	// API 模型候选列表；接口不支持 models.list 时隐藏，保留上面的手动输入框。
+	OptionButton *api_model_choices = nullptr;
 	OptionButton *response_language = nullptr;
 	OptionButton *auth_mode = nullptr;
 	VBoxContainer *chatgpt_section = nullptr;
+	// Codex 模型只能来自 sidecar /v1/models（app-server model/list），不使用任何默认字符串兜底。
+	OptionButton *codex_model = nullptr;
+	Label *codex_model_status = nullptr;
+	// 选中的 Codex 模型是否声明 image input modality；未确认时按不支持处理。
+	bool codex_image_supported = true;
+	bool models_requested = false;
+	bool api_models_requested = false;
+	Button *attach_button = nullptr;
 	Label *chatgpt_status = nullptr;
 	Label *chatgpt_account_info = nullptr;
 	Button *chatgpt_login_button = nullptr;
@@ -161,6 +174,13 @@ class AgentWorkspace : public VBoxContainer {
 
 	bool _is_chatgpt_request(RequestKind p_kind) const;
 	bool _chatgpt_mode_active() const;
+	bool _auth_mode_selected() const;
+	String _codex_model_id() const;
+	void _request_models();
+	void _apply_model_catalog(const Dictionary &p_response);
+	void _on_api_model_choice_selected(int p_index);
+	void _on_codex_model_selected(int p_index);
+	void _update_codex_image_capability();
 	void _apply_config_state(const Dictionary &p_response);
 	bool _apply_chatgpt_account(const Dictionary &p_account);
 	void _update_chatgpt_ui();

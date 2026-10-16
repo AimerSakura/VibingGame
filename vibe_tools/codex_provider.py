@@ -47,6 +47,10 @@ ERR_THREAD_FAILED = "codex_thread_failed"
 ERR_TURN_FAILED = "codex_turn_failed"
 ERR_INTERRUPTED = "codex_turn_interrupted"
 ERR_TOOLS_UNSUPPORTED = "codex_tools_unsupported"
+ERR_MODELS_UNAVAILABLE = "chatgpt_models_unavailable"
+ERR_IMAGE_UNSUPPORTED = "codex_image_unsupported"
+ERR_IMAGE_PATH_INVALID = "codex_image_path_invalid"
+ERR_MODEL_MISSING = "chatgpt_model_missing"
 
 #: A thread id is only ever a bounded, single-line identifier.
 _SAFE_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,199}$")
@@ -343,10 +347,20 @@ class CodexProvider:
         project_root: Any,
         cancel_event: threading.Event | None = None,
         on_event: Callable[[str, dict], Any] | None = None,
+        images: list[str] | None = None,
     ) -> str:
-        """Run one Codex turn in ``workspace_stage`` and return the text reply."""
+        """Run one Codex turn in ``workspace_stage`` and return the text reply.
+
+        ``images`` are absolute paths that must already live inside
+        ``workspace_stage`` (the sidecar copies attachments into an ignored
+        directory there).  Every path is re-validated here so a caller can never
+        hand the app-server an arbitrary local file.  When images are present
+        the configured model's ``model/list`` entry must advertise the ``image``
+        input modality, otherwise the turn is refused with a safe error code.
+        """
         if not isinstance(prompt, str) or not prompt.strip():
             raise CodexProviderError(ERR_TURN_FAILED)
+        safe_images = self._safe_images(images, workspace_stage)
         account = self._resolve_account()
         emit = self._emitter(on_event)
         server: Any = None
@@ -364,6 +378,8 @@ class CodexProvider:
                 server.start()
             except Exception:
                 raise CodexProviderError(ERR_START_FAILED) from None
+            if safe_images:
+                self._require_image_support(server)
             thread_id = self._resume_or_start(server, project_root)
             if cancel_event is not None and cancel_event.is_set():
                 raise CodexProviderError(ERR_INTERRUPTED)
@@ -376,7 +392,7 @@ class CodexProvider:
                 )
                 watcher.start()
             try:
-                for event in server.run_turn(thread_id, prompt):
+                for event in server.run_turn(thread_id, prompt, safe_images):
                     if cancel_event is not None and cancel_event.is_set():
                         interrupted = True
                     kind = getattr(event, "kind", "")
@@ -433,6 +449,109 @@ class CodexProvider:
                 except Exception:
                     pass
             self._log("codex turn stopped account_id=%s", account.account_id)
+
+    # ------------------------------------------------------------------
+    # public: model catalog
+    # ------------------------------------------------------------------
+    def list_models(self) -> list[dict[str, Any]]:
+        """Return the ChatGPT-plan model catalog.
+
+        The list is fetched from a disposable app-server in an isolated temp
+        cwd; no thread is started and no ``thread.json`` is written.  Failures
+        become finite error codes.
+        """
+        account = self._resolve_account()
+        temporary = tempfile.mkdtemp(prefix=_INVOKE_PREFIX)
+        server: Any = None
+        try:
+            server = self._make_server(temporary, account.access_token)
+            with self._server_lock:
+                self._server = server
+            try:
+                server.start()
+            except Exception:
+                raise CodexProviderError(ERR_START_FAILED) from None
+            try:
+                models = server.list_models()
+            except Exception:
+                raise CodexProviderError(ERR_MODELS_UNAVAILABLE) from None
+            return [self._model_entry(model) for model in models]
+        finally:
+            with self._server_lock:
+                if self._server is server:
+                    self._server = None
+            if server is not None:
+                try:
+                    server.stop()
+                except Exception:
+                    pass
+            shutil.rmtree(temporary, ignore_errors=True)
+
+    @staticmethod
+    def _model_entry(model: Any) -> dict[str, Any]:
+        """Normalize a server model into the shared, non-sensitive catalog shape."""
+        def field(name: str, default: Any) -> Any:
+            if isinstance(model, dict):
+                return model.get(name, default)
+            return getattr(model, name, default)
+
+        model_id = str(field("id", "") or "")
+        display = str(field("display_name", "") or field("displayName", "") or model_id)
+        efforts = field("supported_reasoning_efforts", ()) or ()
+        return {
+            "id": model_id,
+            "label": display,
+            "display_name": display,
+            "supports_image": bool(field("supports_image", False)),
+            "is_default": bool(field("is_default", False)),
+            "hidden": bool(field("hidden", False)),
+            "supported_reasoning_efforts": [str(value) for value in efforts],
+        }
+
+    @staticmethod
+    def _safe_images(images: Any, workspace_stage: Any) -> list[str]:
+        """Confine every image path to ``workspace_stage`` before transport."""
+        if not images:
+            return []
+        if not isinstance(images, (list, tuple)):
+            raise CodexProviderError(ERR_IMAGE_PATH_INVALID)
+        try:
+            root = Path(str(workspace_stage)).resolve()
+        except (OSError, ValueError):
+            raise CodexProviderError(ERR_IMAGE_PATH_INVALID) from None
+        safe: list[str] = []
+        for value in list(images)[:8]:
+            if not isinstance(value, str) or not value:
+                raise CodexProviderError(ERR_IMAGE_PATH_INVALID)
+            path = Path(value)
+            if not path.is_absolute():
+                raise CodexProviderError(ERR_IMAGE_PATH_INVALID)
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(root)
+            except (OSError, ValueError):
+                raise CodexProviderError(ERR_IMAGE_PATH_INVALID) from None
+            if not resolved.is_file():
+                raise CodexProviderError(ERR_IMAGE_PATH_INVALID)
+            safe.append(str(resolved))
+        return safe
+
+    def _require_image_support(self, server: Any) -> None:
+        """Refuse image input unless the selected model advertises ``image``."""
+        try:
+            models = server.list_models()
+        except Exception:
+            raise CodexProviderError(ERR_MODELS_UNAVAILABLE) from None
+        target = self._model
+        for model in models:
+            entry = self._model_entry(model)
+            if entry["id"] != target:
+                continue
+            if entry["supports_image"]:
+                return
+            raise CodexProviderError(ERR_IMAGE_UNSUPPORTED)
+        # An unknown/empty model id cannot be proven image-capable: fail closed.
+        raise CodexProviderError(ERR_IMAGE_UNSUPPORTED)
 
     # ------------------------------------------------------------------
     # public: disposable text-only invoke
@@ -522,4 +641,8 @@ __all__ = [
     "ERR_TURN_FAILED",
     "ERR_INTERRUPTED",
     "ERR_TOOLS_UNSUPPORTED",
+    "ERR_MODELS_UNAVAILABLE",
+    "ERR_IMAGE_UNSUPPORTED",
+    "ERR_IMAGE_PATH_INVALID",
+    "ERR_MODEL_MISSING",
 ]
