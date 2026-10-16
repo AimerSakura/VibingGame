@@ -939,6 +939,9 @@ class ChatGptProviderWiringTest(unittest.TestCase):
                 body = "".join(response.iter_text())
         self.assertIn("event: done", body)
         self.assertIn('"status": "cancelled"', body)
+        # The stream must have joined the worker, which releases run_lock in
+        # its finally block, before the next request in this same session runs.
+        self.assertFalse(Runtime.run_lock.locked())
 
         class MissingAccountProvider(_FakeCodexProvider):
             def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event):
@@ -955,6 +958,34 @@ class ChatGptProviderWiringTest(unittest.TestCase):
         self.assertIn("event: error", body)
         self.assertIn("请先登录 ChatGPT 账号", body)
         self.assertNotIn("chatgpt_account_missing", body)
+        self.assertFalse(Runtime.run_lock.locked())
+
+    def test_stream_joins_worker_before_returning(self):
+        """The stream generator must not return while its worker is running."""
+        run_id, run = sidecar_module._new_run("agent", {})
+        worker_threads: list[threading.Thread] = []
+        worker_exited = threading.Event()
+
+        def worker():
+            worker_threads.append(threading.current_thread())
+            sidecar_module._emit(run, "done", status="done")
+            # Stay alive until the generator cancels; without a join the
+            # generator can return while this thread still holds resources.
+            run["cancel"].wait(timeout=5)
+            worker_exited.set()
+
+        stream = sidecar_module._stream(run_id, worker)
+        try:
+            self.assertIn(b"event: protocol_version", next(stream))
+            self.assertIn(b"event: done", next(stream))
+            # Consuming past the done event runs the generator's finally block,
+            # which must join the worker before the stream is exhausted.
+            with self.assertRaises(StopIteration):
+                next(stream)
+            self.assertTrue(worker_exited.is_set())
+            self.assertFalse(worker_threads[0].is_alive())
+        finally:
+            stream.close()
 
     def test_shutdown_stops_codex_providers(self):
         provider = _FakeCodexProvider(codex_exe="/opt/fake-codex", model="gpt-5-codex")
