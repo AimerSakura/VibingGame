@@ -8,6 +8,7 @@ engine="$repo_root/bin/godot.macos.editor.arm64"
 sidecar="$repo_root/.build/sidecar-dist/godotvibe-agent"
 template="$repo_root/misc/dist/macos_tools.app"
 archive="$repo_root/.build/VibeGodot-macOS-arm64.zip"
+fetch_codex="$repo_root/misc/vibe_agent/fetch_codex.sh"
 
 if [[ ! -f "$engine" ]]; then
 	echo "Editor binary not found: $engine" >&2
@@ -22,6 +23,13 @@ case "$output" in
 	*) echo "For safety, output must be under $repo_root/.build" >&2; exit 1 ;;
 esac
 
+# Fetch, verify and stage the official Codex release before touching the app.
+# CODEX_VERSION, CODEX_RELEASE_ROOT and CODEX_BIN pass through for development
+# overrides; fetch_codex.sh still enforces the SHA-256 manifest, the arm64
+# Mach-O layout and the requested version.
+codex_layout="$(bash "$fetch_codex")"
+codex_version="$(bash "$fetch_codex" --validate "$codex_layout")"
+
 rm -rf "$output"
 mkdir -p "$output"
 cp -R "$template" "$app"
@@ -30,6 +38,12 @@ cp "$engine" "$app/Contents/MacOS/VibeGodot"
 chmod +x "$app/Contents/MacOS/VibeGodot"
 rm -rf "$app/Contents/Resources/vibe_agent/godotvibe-agent"
 cp -R "$sidecar" "$app/Contents/Resources/vibe_agent/godotvibe-agent"
+rm -rf "$app/Contents/Resources/vibe_agent/codex"
+cp -R "$codex_layout" "$app/Contents/Resources/vibe_agent/codex"
+
+# Re-verify the copied layout so a broken bundle fails packaging instead of the
+# sidecar at runtime.
+bash "$fetch_codex" --validate "$app/Contents/Resources/vibe_agent/codex" "$codex_version" >/dev/null
 
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable VibeGodot" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName VibeGodot" "$app/Contents/Info.plist"
