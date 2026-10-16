@@ -311,8 +311,13 @@ def _stream(run_id: str, worker) -> Iterator[bytes]:
             if name in ("done", "error"):
                 break
     finally:
-        if thread.is_alive():
-            run["cancel"].set()
+        run["cancel"].set()
+        # The worker keeps ownership of Runtime.run_lock until it observes
+        # cancellation and unwinds. Join it for a bounded time so the stream
+        # does not return -- and the next request in this session does not
+        # start -- while the lock is still held, which otherwise surfaces as a
+        # spurious "同一项目已有任务正在运行。" error.
+        thread.join(timeout=5.0)
 
 
 def _new_run(kind: str, request_data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
