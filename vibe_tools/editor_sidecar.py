@@ -42,6 +42,7 @@ from pydantic import BaseModel, Field
 
 from vibe_tools import codex_accounts, codex_auth
 from vibe_tools.agent import ChatHistoryStore, GameGenerator
+from vibe_tools.codex_provider import CodexProvider, CodexProviderError
 from vibe_tools.editor_credentials import CredentialError, credential, credential_backend
 from vibe_tools.editor_language import LanguageProvider
 from vibe_tools.editor_harness import AcceptanceHarness, project_fingerprint
@@ -83,6 +84,10 @@ class Runtime:
     # next integration step and is deliberately not started or stopped here.
     app_server_status = "stopped"
     app_server_account_id: str | None = None
+    # Live CodexProvider instances. Only non-sensitive state: the app-server
+    # child owns the access token and never exposes it back to the parent.
+    codex_provider: Any = None
+    codex_providers: list[Any] = []
 
 
 class ConfigureRequest(BaseModel):
@@ -343,7 +348,36 @@ def _latest_revertible_run_id() -> str:
     return max(candidates, default=(0.0, ""))[1]
 
 
+def _chatgpt_active() -> bool:
+    """True only when the sidecar capability allows ChatGPT and it is selected."""
+    if Runtime.auth_mode != "chatgpt":
+        return False
+    supported, _ = _codex_capability()
+    return _effective_auth_mode(supported) == "chatgpt"
+
+
+def _codex_provider() -> CodexProvider | None:
+    """Build the sidecar's ChatGPT provider, or ``None`` for API Key mode."""
+    if not _chatgpt_active():
+        return None
+    provider = CodexProvider(
+        codex_exe=Runtime.codex_exe,
+        model=Runtime.config.get("model", ""),
+        account_id=Runtime.chatgpt_account_id,
+    )
+    with Runtime.mutex:
+        Runtime.codex_providers.append(provider)
+        if len(Runtime.codex_providers) > 16:
+            del Runtime.codex_providers[:-16]
+        Runtime.codex_provider = provider
+    return provider
+
+
 def _provider(visual: bool = False):
+    if not visual:
+        codex = _codex_provider()
+        if codex is not None:
+            return LanguageProvider(codex, Runtime.config.get("response_language", "zh-CN"))
     key = credential("api_key")
     model = Runtime.config.get("vision_model" if visual else "model", "")
     if not key or not model:
@@ -351,6 +385,41 @@ def _provider(visual: bool = False):
     return LanguageProvider(SimpleLLMProvider(api_key=key, base_url=Runtime.config["base_url"] or None,
                              # This provider counts total attempts, not extra retries.
                              model=model, max_retries=1, request_timeout=45), Runtime.config.get("response_language", "zh-CN"))
+
+
+# Fixed, credential-free messages for the finite CodexProvider error codes.
+_CODEX_ERROR_MESSAGES = {
+    "chatgpt_account_missing": "请先登录 ChatGPT 账号，或切换到 API Key 模式。",
+    "chatgpt_account_unavailable": "无法读取 ChatGPT 账号，请在设置中重新登录。",
+    "chatgpt_refresh_failed": "ChatGPT 登录已失效，请在设置中重新登录。",
+    "codex_app_server_start_failed": "无法启动 Codex，请检查 codex 可执行文件。",
+    "codex_thread_failed": "Codex 会话启动失败，请重试。",
+    "codex_turn_failed": "Codex 回合失败，请重试。",
+    "codex_turn_interrupted": "Codex 回合已取消。",
+    "codex_tools_unsupported": "当前模式不支持工具调用。",
+}
+
+
+def _codex_error_message(error: BaseException) -> str:
+    return _CODEX_ERROR_MESSAGES.get(str(error), "ChatGPT 任务失败，请重试。")
+
+
+def _codex_event(run: dict[str, Any], name: str, payload: dict[str, Any]) -> None:
+    """Map a CodexProvider event onto the sidecar's existing SSE vocabulary."""
+    if name == "agent_delta":
+        _emit(run, "agent_delta", text=str(payload.get("text", "")))
+    elif name == "command_output":
+        text = str(payload.get("text", ""))
+        _emit(run, "command_output", text=text)
+        _emit(run, "step", type="command_output", description=text[:500])
+    elif name == "file_change":
+        path = str(payload.get("path", ""))
+        _emit(run, "file_change", path=path)
+        _emit(run, "step", type="file_change", description="修改：" + path)
+    elif name == "turn_completed":
+        _emit(run, "step", type="turn_completed", description="Codex 回合完成", status=payload.get("status"))
+    elif name == "error":
+        _emit(run, "step", type="error", description=_CODEX_ERROR_MESSAGES["codex_turn_failed"])
 
 
 def _commit_workspace(run, workspace, request):
@@ -489,9 +558,29 @@ def _run_workflow(run: dict[str, Any], request: AgentRequest | HarnessRunRequest
         harness = AcceptanceHarness(Runtime.project, Runtime.godot_exe, vision=_provider(True))
         import vibe_tools.agent as agent_module
         agent_module.VISION_MODEL = Runtime.config["vision_model"]
+        chatgpt = _chatgpt_active()
 
         def modify(prompt):
             nonlocal workspace
+            if chatgpt:
+                if workspace is None:
+                    workspace = Workspace(Runtime.project, _agent_dir(), run["id"])
+                provider = _codex_provider()
+                if provider is None:
+                    raise CodexProviderError("chatgpt_account_missing")
+                Runtime.app_server_status = "running"
+                Runtime.app_server_account_id = provider.last_account_id
+                try:
+                    # The app-server runs inside the disposable stage; its
+                    # changes are only written back through _commit_workspace.
+                    reply = provider.run_agent(
+                        prompt, str(workspace.stage), Runtime.project, run["cancel"],
+                        lambda name, payload: _codex_event(run, name, payload))
+                finally:
+                    Runtime.app_server_status = "stopped"
+                    Runtime.app_server_account_id = provider.last_account_id
+                _commit_workspace(run, workspace, request)
+                return {"reply": reply, "ok": True}
             api_key = credential("api_key")
             if not api_key:
                 raise ValueError("请先在 Agent 设置中保存 API Key。")
@@ -550,6 +639,15 @@ def _run_workflow(run: dict[str, Any], request: AgentRequest | HarnessRunRequest
     except InterruptedError as error:
         run["status"] = "cancelled"
         _emit(run, "done", status="cancelled", reply="", changed_files=run["changed_files"], message=str(error))
+    except CodexProviderError as error:
+        # Cancellation during a Codex turn is a normal stop, not a failure.
+        if run["cancel"].is_set():
+            run["status"] = "cancelled"
+            _emit(run, "done", status="cancelled", reply="", changed_files=run["changed_files"], message="任务已取消")
+        else:
+            run["status"] = "error"
+            _emit(run, "error", message=_codex_error_message(error), retryable=True,
+                  changed_files=run["changed_files"])
     except (Conflict, ValueError) as error:
         run["status"] = "error"
         _emit(run, "error", message=str(error), retryable=True, changed_files=run["changed_files"])
@@ -936,6 +1034,21 @@ def _shutdown_auth_attempts() -> None:
         _clear_attempt_secrets(attempt)
 
 
+def _shutdown_codex_providers() -> None:
+    """Stop every live CodexProvider so no app-server child survives shutdown."""
+    with Runtime.mutex:
+        providers = list(Runtime.codex_providers)
+        Runtime.codex_providers = []
+        Runtime.codex_provider = None
+    for provider in providers:
+        try:
+            provider.stop()
+        except Exception:
+            pass
+    Runtime.app_server_status = "stopped"
+    Runtime.app_server_account_id = None
+
+
 def _configure_payload(has_api_key: bool) -> dict[str, Any]:
     supported, codex_version = _codex_capability()
     payload = {
@@ -1225,6 +1338,7 @@ def harness_artifact(artifact_path: str):
 @app.post("/v1/shutdown")
 def shutdown() -> dict[str, Any]:
     _shutdown_auth_attempts()
+    _shutdown_codex_providers()
 
     def stop() -> None:
         time.sleep(0.1)

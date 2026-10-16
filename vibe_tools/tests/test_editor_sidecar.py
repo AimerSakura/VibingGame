@@ -30,6 +30,8 @@ def _reset_auth_state() -> None:
     Runtime.chatgpt_account = None
     Runtime.app_server_status = "stopped"
     Runtime.app_server_account_id = None
+    Runtime.codex_provider = None
+    Runtime.codex_providers = []
     Runtime.codex_probed = True
     Runtime.codex_exe = ""
     Runtime.codex_version = ""
@@ -735,6 +737,172 @@ class ChatGptAuthTest(unittest.TestCase):
         self.assertTrue(fake.closed)
         self.assertTrue(attempt["cancel"].is_set())
         self.assertEqual(attempt["verifier"], "")
+
+
+class _FakeCodexProvider:
+    """Offline stand-in for CodexProvider; records the stage it was handed."""
+
+    instances: list["_FakeCodexProvider"] = []
+
+    def __init__(self, *, codex_exe, model, account_id=None):
+        self.codex_exe = codex_exe
+        self.model = model
+        self.account_id = account_id
+        self.last_account_id = "acct-fake"
+        self.runs: list[dict] = []
+        self.stopped = False
+        self.live_at_run: str | None = None
+        type(self).instances.append(self)
+
+    def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event):
+        self.runs.append({
+            "prompt": prompt, "stage": str(workspace_stage),
+            "project_root": str(project_root), "cancel": cancel_event,
+        })
+        self.live_at_run = (Path(project_root) / "game.gd").read_text(encoding="utf-8")
+        stage = Path(workspace_stage)
+        (stage / "game.gd").write_text("agent changed\n", encoding="utf-8")
+        on_event("agent_delta", {"text": "work "})
+        on_event("agent_delta", {"text": "done"})
+        on_event("command_output", {"text": "echo hi"})
+        on_event("file_change", {"path": "res://game.gd"})
+        on_event("turn_completed", {"status": "completed"})
+        return "work done"
+
+    def stop(self):
+        self.stopped = True
+
+    def invoke(self, messages, **kwargs):
+        return "{}"
+
+
+class ChatGptProviderWiringTest(unittest.TestCase):
+    """ChatGPT provider wiring for the sidecar, using only fake components."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.project = Path(self.temp.name) / "project"
+        self.project.mkdir()
+        (self.project / "project.godot").write_text("config_version=5\n", encoding="utf-8")
+        (self.project / "game.gd").write_text("extends Node\n", encoding="utf-8")
+        Runtime.project = self.project.resolve()
+        Runtime.token = "sidecar-token"
+        Runtime.parent_pid = 123
+        Runtime.godot_exe = sys.executable
+        Runtime.runs = {}
+        Runtime.config = {"response_language": "zh-CN", "base_url": "", "model": "gpt-5-codex",
+                          "vision_model": "gemini-2.5-flash"}
+        _reset_auth_state()
+        Runtime.auth_mode = "chatgpt"
+        Runtime.codex_exe = "/opt/fake-codex"
+        Runtime.codex_version = "1.2.3"
+        _FakeCodexProvider.instances = []
+        self.client = TestClient(app)
+        self.headers = {"Authorization": "Bearer sidecar-token"}
+        self.credentials = patch.object(sidecar_module, "credential", return_value="")
+        self.credentials.start()
+        self.backend = patch.object(sidecar_module, "credential_backend", return_value="macos")
+        self.backend.start()
+        self.platform = patch.object(sidecar_module.sys, "platform", "darwin")
+        self.platform.start()
+
+    def tearDown(self):
+        self.platform.stop()
+        self.backend.stop()
+        self.credentials.stop()
+        _reset_auth_state()
+        self.temp.cleanup()
+
+    def test_provider_factory_dispatches_on_auth_mode(self):
+        with patch.object(sidecar_module, "CodexProvider", _FakeCodexProvider):
+            provider = sidecar_module._provider()
+        self.assertIsInstance(provider, sidecar_module.LanguageProvider)
+        self.assertIsInstance(provider.provider, _FakeCodexProvider)
+
+        Runtime.auth_mode = "api_key"
+        with patch.object(sidecar_module, "credential", return_value="test-key"), \
+             patch("vibe_tools.llm_transfer.SimpleLLMProvider._init_client"):
+            provider = sidecar_module._provider()
+        self.assertIsInstance(provider.provider, sidecar_module.SimpleLLMProvider)
+
+    def test_chatgpt_run_stream_commits_stage_changes(self):
+        original = (self.project / "game.gd").read_text(encoding="utf-8")
+        with patch.object(sidecar_module, "CodexProvider", _FakeCodexProvider), \
+             patch.object(sidecar_module, "_generate_plan"), \
+             patch.object(sidecar_module, "_repair_cycle", return_value=None):
+            with self.client.stream(
+                "POST", "/v1/agent/run-stream", headers=self.headers,
+                json={"prompt": "fix jump", "editor_sync": False},
+            ) as response:
+                body = "".join(response.iter_text())
+
+        self.assertEqual(response.status_code, 200, body)
+        self.assertIn("event: agent_delta", body)
+        self.assertIn("event: command_output", body)
+        self.assertIn("event: file_change", body)
+        self.assertIn("event: step", body)
+        self.assertIn("event: done", body)
+        self.assertIn('"reply": "work done"', body)
+        self.assertIn('"status": "done"', body)
+
+        provider = _FakeCodexProvider.instances[-1]
+        run_info = provider.runs[0]
+        # The app-server turn ran against the disposable stage, and the live
+        # project still held its original content while the turn was running.
+        self.assertNotEqual(run_info["stage"], str(Runtime.project))
+        self.assertIn("transactions", run_info["stage"])
+        self.assertEqual(run_info["project_root"], str(Runtime.project))
+        self.assertEqual(provider.live_at_run, original)
+        self.assertEqual((self.project / "game.gd").read_text(encoding="utf-8"), "agent changed\n")
+        self.assertEqual(Runtime.app_server_status, "stopped")
+
+    def test_chatgpt_run_stream_maps_cancel_and_safe_errors(self):
+        class CancellingProvider(_FakeCodexProvider):
+            def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event):
+                cancel_event.set()
+                raise sidecar_module.CodexProviderError("codex_turn_interrupted")
+
+        with patch.object(sidecar_module, "CodexProvider", CancellingProvider), \
+             patch.object(sidecar_module, "_generate_plan"), \
+             patch.object(sidecar_module, "_repair_cycle", return_value=None):
+            with self.client.stream(
+                "POST", "/v1/agent/run-stream", headers=self.headers,
+                json={"prompt": "fix jump", "editor_sync": False},
+            ) as response:
+                body = "".join(response.iter_text())
+        self.assertIn("event: done", body)
+        self.assertIn('"status": "cancelled"', body)
+
+        class MissingAccountProvider(_FakeCodexProvider):
+            def run_agent(self, prompt, workspace_stage, project_root, cancel_event, on_event):
+                raise sidecar_module.CodexProviderError("chatgpt_account_missing")
+
+        with patch.object(sidecar_module, "CodexProvider", MissingAccountProvider), \
+             patch.object(sidecar_module, "_generate_plan"), \
+             patch.object(sidecar_module, "_repair_cycle", return_value=None):
+            with self.client.stream(
+                "POST", "/v1/agent/run-stream", headers=self.headers,
+                json={"prompt": "fix jump", "editor_sync": False},
+            ) as response:
+                body = "".join(response.iter_text())
+        self.assertIn("event: error", body)
+        self.assertIn("请先登录 ChatGPT 账号", body)
+        self.assertNotIn("chatgpt_account_missing", body)
+
+    def test_shutdown_stops_codex_providers(self):
+        provider = _FakeCodexProvider(codex_exe="/opt/fake-codex", model="gpt-5-codex")
+        Runtime.codex_providers = [provider]
+        Runtime.codex_provider = provider
+        Runtime.app_server_status = "running"
+        Runtime.app_server_account_id = "acct-fake"
+        with patch.object(sidecar_module.threading, "Thread"):
+            response = self.client.post("/v1/shutdown", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(provider.stopped)
+        self.assertEqual(Runtime.codex_providers, [])
+        self.assertIsNone(Runtime.codex_provider)
+        self.assertEqual(Runtime.app_server_status, "stopped")
+        self.assertIsNone(Runtime.app_server_account_id)
 
 
 if __name__ == "__main__":
