@@ -445,6 +445,24 @@ class ChatGptAuthTest(unittest.TestCase):
             conflict = self.client.post("/v1/configure", headers=self.headers, json={"auth_mode": "chatgpt"})
             self.assertEqual(conflict.status_code, 409)
 
+    def test_windows_gate_forces_api_key_and_blocks_chatgpt(self):
+        self._enable_chatgpt()
+        with patch.object(sidecar_module.sys, "platform", "win32"):
+            body = self.client.get("/v1/configure", headers=self.headers).json()
+            self.assertEqual(body["auth_mode"], "api_key")
+            self.assertFalse(body["chatgpt_supported"])
+            self.assertEqual(body["codex_version"], "")
+
+            conflict = self.client.post(
+                "/v1/configure", headers=self.headers, json={"auth_mode": "chatgpt"})
+            self.assertEqual(conflict.status_code, 409)
+            self.assertEqual(Runtime.auth_mode, "api_key")
+
+            started = self.client.post("/v1/auth/chatgpt/start", headers=self.headers, json={})
+            self.assertEqual(started.status_code, 409)
+        self.assertFalse(
+            any(attempt.get("status") == "authorizing" for attempt in Runtime.auth_attempts.values()))
+
     def test_configure_stores_selected_account_id_without_tokens(self):
         self._enable_chatgpt()
         with patch.object(sidecar_module.sys, "platform", "darwin"), \
