@@ -238,6 +238,67 @@ class _FakeLoopback:
         self.closed = True
 
 
+class _FakeJwksResponse:
+    """Minimal urlopen response used to observe how much of a body is read."""
+
+    def __init__(self, body: bytes):
+        self._body = body
+        self.read_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        if size is None or size < 0:
+            return self._body
+        return self._body[:size]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class JwksResolutionTest(unittest.TestCase):
+    """Regression tests for hardened JWKS discovery."""
+
+    def test_http_url_is_rejected_without_fetching(self):
+        body = json.dumps({"keys": [{"kty": "RSA"}]}).encode("utf-8")
+        fake = _FakeJwksResponse(body)
+        with patch.object(sidecar_module.urllib.request, "urlopen", return_value=fake) as urlopen:
+            with self.assertRaises(sidecar_module.codex_auth.CodexAuthError) as ctx:
+                sidecar_module._resolve_jwks({"jwks_uri": "http://example.com/jwks"})
+        self.assertEqual(str(ctx.exception), "discovery_failed")
+        urlopen.assert_not_called()
+
+    def test_https_url_reads_body_with_bounded_size(self):
+        body = json.dumps({"keys": [{"kty": "RSA"}]}).encode("utf-8")
+        fake = _FakeJwksResponse(body)
+        with patch.object(sidecar_module.urllib.request, "urlopen", return_value=fake):
+            result = sidecar_module._resolve_jwks({"jwks_uri": "https://example.com/jwks"})
+        self.assertEqual(result, {"keys": [{"kty": "RSA"}]})
+        self.assertTrue(fake.read_sizes)
+        self.assertNotEqual(fake.read_sizes[0], -1)
+        self.assertLessEqual(fake.read_sizes[0], 64 * 1024 + 1)
+
+    def test_oversized_body_is_rejected(self):
+        fake = _FakeJwksResponse(b"{" * (64 * 1024 + 1))
+        with patch.object(sidecar_module.urllib.request, "urlopen", return_value=fake):
+            with self.assertRaises(sidecar_module.codex_auth.CodexAuthError) as ctx:
+                sidecar_module._resolve_jwks({"jwks_uri": "https://example.com/jwks"})
+        self.assertEqual(str(ctx.exception), "discovery_failed")
+        self.assertNotEqual(fake.read_sizes[0], -1)
+
+    def test_unparseable_body_reports_sanitized_error(self):
+        secret = "SENSITIVE-JWKS-BODY"
+        fake = _FakeJwksResponse(secret.encode("utf-8"))
+        with patch.object(sidecar_module.urllib.request, "urlopen", return_value=fake):
+            with self.assertRaises(sidecar_module.codex_auth.CodexAuthError) as ctx:
+                sidecar_module._resolve_jwks({"jwks_uri": "https://secret.example.com/jwks"})
+        self.assertEqual(str(ctx.exception), "discovery_failed")
+        self.assertNotIn(secret, str(ctx.exception))
+        self.assertNotIn("secret.example.com", str(ctx.exception))
+
+
 class ChatGptAuthTest(unittest.TestCase):
     """Offline, non-privileged tests for the SIWC auth state and endpoints."""
 
@@ -585,6 +646,62 @@ class ChatGptAuthTest(unittest.TestCase):
                 "/v1/auth/chatgpt/logout", headers=self.headers, json={"account_id": "acct-1"})
         self.assertEqual(response.json(), {"status": "revoke_unconfirmed"})
         delete.assert_called_once_with("acct-1")
+
+    def test_logout_other_account_preserves_active_runtime_state(self):
+        active_metadata = {"account_id": "acct-1", "label": "L", "email": "e@example.com", "plan_enabled": True}
+        Runtime.chatgpt_account_id = "acct-1"
+        Runtime.chatgpt_account = dict(active_metadata)
+        Runtime.app_server_status = "running"
+        Runtime.app_server_account_id = "acct-2"
+        with patch.object(sidecar_module.codex_accounts, "load_account", return_value=None), \
+             patch.object(sidecar_module.codex_accounts, "delete_account") as delete, \
+             patch.object(sidecar_module.codex_accounts, "active_account_id", return_value="acct-1"), \
+             patch.object(sidecar_module.codex_accounts, "set_active_account") as set_active:
+            response = self.client.post(
+                "/v1/auth/chatgpt/logout", headers=self.headers, json={"account_id": "acct-3"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"status": "revoke_unconfirmed"})
+        delete.assert_called_once_with("acct-3")
+        set_active.assert_not_called()
+        self.assertEqual(Runtime.chatgpt_account_id, "acct-1")
+        self.assertEqual(Runtime.chatgpt_account, active_metadata)
+        self.assertEqual(Runtime.app_server_status, "running")
+        self.assertEqual(Runtime.app_server_account_id, "acct-2")
+
+    def test_logout_current_account_clears_only_chatgpt_state(self):
+        Runtime.chatgpt_account_id = "acct-1"
+        Runtime.chatgpt_account = {"account_id": "acct-1", "label": "L", "email": "e@example.com", "plan_enabled": True}
+        Runtime.app_server_status = "running"
+        Runtime.app_server_account_id = "acct-2"
+        with patch.object(sidecar_module.codex_accounts, "load_account", return_value=None), \
+             patch.object(sidecar_module.codex_accounts, "delete_account"), \
+             patch.object(sidecar_module.codex_accounts, "active_account_id", return_value="acct-1"), \
+             patch.object(sidecar_module.codex_accounts, "set_active_account"):
+            response = self.client.post(
+                "/v1/auth/chatgpt/logout", headers=self.headers, json={"account_id": "acct-1"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(Runtime.chatgpt_account_id)
+        self.assertIsNone(Runtime.chatgpt_account)
+        self.assertEqual(Runtime.app_server_status, "running")
+        self.assertEqual(Runtime.app_server_account_id, "acct-2")
+
+    def test_logout_app_server_account_clears_only_app_server_state(self):
+        active_metadata = {"account_id": "acct-1", "label": "L", "email": "e@example.com", "plan_enabled": True}
+        Runtime.chatgpt_account_id = "acct-1"
+        Runtime.chatgpt_account = dict(active_metadata)
+        Runtime.app_server_status = "running"
+        Runtime.app_server_account_id = "acct-2"
+        with patch.object(sidecar_module.codex_accounts, "load_account", return_value=None), \
+             patch.object(sidecar_module.codex_accounts, "delete_account"), \
+             patch.object(sidecar_module.codex_accounts, "active_account_id", return_value="acct-1"), \
+             patch.object(sidecar_module.codex_accounts, "set_active_account"):
+            response = self.client.post(
+                "/v1/auth/chatgpt/logout", headers=self.headers, json={"account_id": "acct-2"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(Runtime.chatgpt_account_id, "acct-1")
+        self.assertEqual(Runtime.chatgpt_account, active_metadata)
+        self.assertEqual(Runtime.app_server_status, "stopped")
+        self.assertIsNone(Runtime.app_server_account_id)
 
     def test_accounts_returns_metadata_only(self):
         metadata = [{"account_id": "a1", "label": "L", "email": "e@example.com", "plan_enabled": True}]

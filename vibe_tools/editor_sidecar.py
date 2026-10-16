@@ -589,6 +589,8 @@ def health() -> dict[str, Any]:
 _SAFE_AUTH_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _CODEX_VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?(?:[-+][0-9A-Za-z.]+)?")
 _CHATGPT_UNSUPPORTED = "ChatGPT sign-in is not supported on this platform yet"
+# JWKS documents are tiny; refuse to buffer more than this from discovery.
+_MAX_JWKS_BYTES = 64 * 1024
 
 
 def _is_macos() -> bool:
@@ -746,16 +748,20 @@ def _resolve_jwks(metadata: Any) -> dict[str, Any]:
     if isinstance(keys, list) and keys:
         return {"keys": keys}
     jwks_uri = metadata.get("jwks_uri")
-    if not isinstance(jwks_uri, str) or not jwks_uri.startswith(("https://", "http://")):
+    # Only HTTPS discovery endpoints are trusted; never follow plain HTTP.
+    if not isinstance(jwks_uri, str) or not jwks_uri.lower().startswith("https://"):
         raise codex_auth.CodexAuthError("discovery_failed")
     request = urllib.request.Request(jwks_uri, headers={"Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            raw = response.read()
+            # Bound the read so an oversized or endless body cannot exhaust memory.
+            raw = response.read(_MAX_JWKS_BYTES + 1)
     except Exception:
         raise codex_auth.CodexAuthError("discovery_failed") from None
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) > _MAX_JWKS_BYTES:
+        raise codex_auth.CodexAuthError("discovery_failed")
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = json.loads(bytes(raw).decode("utf-8"))
     except Exception:
         raise codex_auth.CodexAuthError("discovery_failed") from None
     if not isinstance(data, dict):
@@ -1078,11 +1084,14 @@ def chatgpt_logout(request: ChatGptLogoutRequest) -> dict[str, Any]:
     except Exception:
         pass
     with Runtime.auth_lock:
+        # Only touch runtime state that actually belongs to the logged-out
+        # account; signing out one account must not disrupt another active one.
         if Runtime.chatgpt_account_id == account_id:
             Runtime.chatgpt_account_id = None
-        Runtime.chatgpt_account = None
-    Runtime.app_server_status = "stopped"
-    Runtime.app_server_account_id = None
+            Runtime.chatgpt_account = None
+        if Runtime.app_server_account_id == account_id:
+            Runtime.app_server_account_id = None
+            Runtime.app_server_status = "stopped"
     return {"status": "revoked" if confirmed else "revoke_unconfirmed"}
 
 
