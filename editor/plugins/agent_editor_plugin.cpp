@@ -41,6 +41,70 @@ String AgentWorkspace::_u8(const char *p_text) {
 	return String::utf8(p_text);
 }
 
+// ChatGPT 认证完全由 sidecar 托管：编辑器只持有短期 login_id/account_id 和展示用 metadata。
+// 下面的过滤保证这些值只作为有界普通字符串使用，绝不会拼进 shell 命令，也不会把 sidecar 的
+// 原始错误文本回显到界面。
+static String _agent_auth_identifier(const Variant &p_value) {
+	String value = String(p_value).strip_edges();
+	if (value.is_empty() || value.length() > 200) {
+		return String();
+	}
+	for (int index = 0; index < value.length(); index++) {
+		const char32_t c = value[index];
+		const bool allowed = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' || c == '_' || c == '.';
+		if (!allowed) {
+			return String();
+		}
+	}
+	return value;
+}
+
+static String _agent_auth_text(const Variant &p_value, int p_max) {
+	String out;
+	String text = String(p_value).strip_edges();
+	for (int index = 0; index < text.length() && out.length() < p_max; index++) {
+		const char32_t c = text[index];
+		if (c == '\n' || c == '\r' || c == '\t') {
+			out += " ";
+			continue;
+		}
+		if (c < 32 || c == 127) {
+			continue;
+		}
+		out += String::chr(c);
+	}
+	return out.strip_edges();
+}
+
+static Dictionary _agent_auth_account(const Dictionary &p_response) {
+	Variant nested = p_response.get("chatgpt_account", Variant());
+	if (nested.get_type() == Variant::DICTIONARY) {
+		return Dictionary(nested);
+	}
+	nested = p_response.get("account", Variant());
+	if (nested.get_type() == Variant::DICTIONARY) {
+		return Dictionary(nested);
+	}
+	if (p_response.has("account_id") || p_response.has("email") || p_response.has("plan_enabled")) {
+		return p_response;
+	}
+	return Dictionary();
+}
+
+static bool _agent_auth_flag(const Variant &p_value, bool p_default) {
+	if (p_value.get_type() == Variant::NIL) {
+		return p_default;
+	}
+	if (p_value.get_type() == Variant::BOOL) {
+		return bool(p_value);
+	}
+	String text = String(p_value).strip_edges().to_lower();
+	if (text.is_empty()) {
+		return p_default;
+	}
+	return !(text == "false" || text == "0" || text == "no" || text == "off");
+}
+
 void AgentWorkspace::_set_status(const String &p_text, bool p_error) {
 	status->set_text(p_text);
 	status->add_theme_color_override(SNAME("font_color"), p_error ? Color(1.0, 0.35, 0.35) : Color(0.55, 0.75, 0.95));
@@ -272,13 +336,131 @@ void AgentWorkspace::_request(const String &p_path, HTTPClient::Method p_method,
 }
 
 void AgentWorkspace::_push_configuration(bool p_include_key) {
+	// auth_mode 只在 macOS + Codex capability 且已登录账号时才切换为 chatgpt；
+	// 其余情况保持 API Key 流程，确保 Windows/Linux 与旧行为不变。
+	const bool chatgpt = _chatgpt_mode_active();
 	Dictionary body;
-	body["api_key"] = p_include_key ? api_key->get_text() : String();
+	body["api_key"] = (p_include_key && !chatgpt) ? api_key->get_text() : String();
 	body["base_url"] = base_url->get_text().strip_edges();
 	body["model"] = model->get_text().strip_edges();
 	body["vision_model"] = vision_model->get_text().strip_edges();
 	body["response_language"] = response_language->get_item_metadata(response_language->get_selected());
+	body["auth_mode"] = chatgpt ? "chatgpt" : "api_key";
+	if (chatgpt) {
+		body["chatgpt_account_id"] = chatgpt_account_id;
+	}
 	_request("/v1/configure", HTTPClient::METHOD_POST, body, REQUEST_CONFIGURE);
+}
+
+bool AgentWorkspace::_chatgpt_mode_active() const {
+#if defined(MACOS_ENABLED)
+	if (!auth_mode || !chatgpt_supported || chatgpt_codex_version.is_empty() || chatgpt_account_id.is_empty()) {
+		return false;
+	}
+	return auth_mode->get_selected() == 1;
+#else
+	return false;
+#endif
+}
+
+bool AgentWorkspace::_is_chatgpt_request(RequestKind p_kind) const {
+	return p_kind == REQUEST_CHATGPT_START || p_kind == REQUEST_CHATGPT_STATUS ||
+			p_kind == REQUEST_CHATGPT_CANCEL || p_kind == REQUEST_CHATGPT_LOGOUT;
+}
+
+bool AgentWorkspace::_apply_chatgpt_account(const Dictionary &p_account) {
+	String account_id = _agent_auth_identifier(p_account.get("account_id", ""));
+	if (account_id.is_empty()) {
+		return false;
+	}
+	chatgpt_account_id = account_id;
+	chatgpt_account_label = _agent_auth_text(p_account.get("label", ""), 120);
+	chatgpt_account_email = _agent_auth_text(p_account.get("email", ""), 160);
+	chatgpt_plan_enabled = _agent_auth_flag(p_account.get("plan_enabled", Variant()), true);
+	if (chatgpt_account_label.is_empty()) {
+		chatgpt_account_label = chatgpt_account_email.is_empty() ? account_id : chatgpt_account_email;
+	}
+	return true;
+}
+
+void AgentWorkspace::_apply_config_state(const Dictionary &p_response) {
+	String credential_store = String(p_response.get("credential_store", "windows"));
+	String saved_label = credential_store == "macos"
+			? _u8("已保存到 macOS 钥匙串")
+			: _u8("已保存到 Windows 凭据管理器");
+	api_key->set_placeholder(p_response.get("has_api_key", false) ? saved_label : _u8("输入 API Key"));
+
+	chatgpt_supported = _agent_auth_flag(p_response.get("chatgpt_supported", Variant()), chatgpt_supported);
+	if (p_response.has("codex_version")) {
+		chatgpt_codex_version = _agent_auth_text(p_response.get("codex_version", ""), 64);
+	}
+	Dictionary account = _agent_auth_account(p_response);
+	if (!account.is_empty() && !_apply_chatgpt_account(account)) {
+		// sidecar 返回了无法安全使用的账号标识：保持未登录状态。
+		chatgpt_account_id.clear();
+	}
+#if defined(MACOS_ENABLED)
+	if (auth_mode) {
+		String mode = String(p_response.get("auth_mode", "")).strip_edges().to_lower();
+		if (mode == "chatgpt") {
+			auth_mode->select(1);
+		} else if (mode == "api_key") {
+			auth_mode->select(0);
+		}
+	}
+#endif
+	_update_chatgpt_ui();
+}
+
+void AgentWorkspace::_update_chatgpt_ui() {
+	if (!auth_mode || !chatgpt_section || !chatgpt_status || !chatgpt_account_info || !chatgpt_login_button || !chatgpt_cancel_button || !chatgpt_logout_button) {
+		return;
+	}
+	const bool capable = chatgpt_supported && !chatgpt_codex_version.is_empty();
+	// ChatGPT 选项只在 macOS 且 sidecar 报告 Codex capability 时启用。
+	auth_mode->set_item_disabled(1, !capable);
+	if (!capable && auth_mode->get_selected() == 1) {
+		auth_mode->select(0);
+	}
+	chatgpt_section->set_visible(capable);
+	if (!capable) {
+		chatgpt_status->set_text(_u8("当前 Codex 版本不支持 ChatGPT 登录"));
+		chatgpt_account_info->set_text(String());
+		chatgpt_login_button->set_disabled(true);
+		chatgpt_cancel_button->set_disabled(true);
+		chatgpt_logout_button->set_disabled(true);
+		return;
+	}
+	const bool logged_in = !chatgpt_account_id.is_empty();
+	if (chatgpt_login_active) {
+		chatgpt_status->set_text(vformat(_u8("等待 ChatGPT 授权完成…（Codex %s）"), chatgpt_codex_version));
+	} else if (logged_in) {
+		chatgpt_status->set_text(vformat(_u8("已登录（Codex %s）"), chatgpt_codex_version));
+	} else {
+		chatgpt_status->set_text(vformat(_u8("未登录（Codex %s）"), chatgpt_codex_version));
+	}
+	// 账号 metadata 仅展示 label/email/plan_enabled；plan_enabled=false 时仍显示账号并明确提示。
+	String info;
+	if (logged_in) {
+		info = chatgpt_account_label;
+		if (!chatgpt_account_email.is_empty() && chatgpt_account_email != chatgpt_account_label) {
+			info += info.is_empty() ? chatgpt_account_email : " (" + chatgpt_account_email + ")";
+		}
+		if (!chatgpt_plan_enabled) {
+			info += _u8("\n当前账号不具备 Codex 计划能力，可能无法使用 ChatGPT 账号运行 Agent。");
+		}
+	}
+	chatgpt_account_info->set_text(info);
+	chatgpt_login_button->set_disabled(chatgpt_login_active || logged_in || !backend_ready);
+	chatgpt_cancel_button->set_disabled(!chatgpt_login_active || chatgpt_login_id.is_empty());
+	chatgpt_logout_button->set_disabled(chatgpt_login_active || !logged_in || !backend_ready);
+}
+
+void AgentWorkspace::_refresh_config_state() {
+	if (!backend_ready || request_kind != REQUEST_NONE || task_running) {
+		return;
+	}
+	_request("/v1/configure", HTTPClient::METHOD_GET, Dictionary(), REQUEST_CONFIG_STATE);
 }
 
 void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedStringArray &p_headers, const PackedByteArray &p_body) {
@@ -288,6 +470,15 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 	Variant parsed = JSON::parse_string(response_text);
 	Dictionary response = parsed.get_type() == Variant::DICTIONARY ? Dictionary(parsed) : Dictionary();
 	if (p_result != HTTPRequest::RESULT_SUCCESS || p_code < 200 || p_code >= 300) {
+		if (_is_chatgpt_request(completed)) {
+			// 认证接口不回显 sidecar 原始错误文本，只给安全提示。
+			_handle_chatgpt_request_error(completed, p_code);
+			return;
+		}
+		if (completed == REQUEST_CONFIG_STATE) {
+			// 能力探测失败时保持现有 UI，不显示原始错误；稍后由进程循环重试。
+			return;
+		}
 		String detail = response.has("detail") ? String(response["detail"]) : response_text;
 		_set_status(vformat(_u8("后台请求失败（HTTP %d）：%s"), p_code, detail), true);
 		return;
@@ -306,12 +497,48 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 		} break;
 		case REQUEST_CONFIGURE: {
 			api_key->clear();
-			String credential_store = response.get("credential_store", "windows");
-			String saved_label = credential_store == "macos"
-					? _u8("已保存到 macOS 钥匙串")
-					: _u8("已保存到 Windows 凭据管理器");
-			api_key->set_placeholder(response.get("has_api_key", false) ? saved_label : _u8("输入 API Key"));
+			_apply_config_state(response);
 			_request("/v1/chat/history", HTTPClient::METHOD_GET, Dictionary(), REQUEST_HISTORY);
+		} break;
+		case REQUEST_CONFIG_STATE: {
+			config_state_loaded = true;
+			_apply_config_state(response);
+		} break;
+		case REQUEST_CHATGPT_START: {
+			String login_id = _agent_auth_identifier(response.get("login_id", ""));
+			if (login_id.is_empty()) {
+				_finish_chatgpt_login();
+				_set_status(_u8("ChatGPT 登录启动失败，请重试或改用 API Key"), true);
+				return;
+			}
+			chatgpt_login_id = login_id;
+			chatgpt_login_elapsed = 0.0;
+			chatgpt_poll_elapsed = 1.0;
+			String state = String(response.get("status", "pending")).strip_edges().to_lower();
+			if (state == "completed" || state == "complete" || state == "success" || state == "succeeded") {
+				_handle_chatgpt_status_response(response);
+			} else if (state == "failed" || state == "error" || state == "cancelled" || state == "canceled") {
+				_finish_chatgpt_login();
+				_set_status(_u8("ChatGPT 登录未能启动，请重试或改用 API Key"), true);
+			} else {
+				_update_chatgpt_ui();
+				_set_status(_u8("请在浏览器中完成 ChatGPT 授权…"));
+			}
+		} break;
+		case REQUEST_CHATGPT_STATUS: {
+			_handle_chatgpt_status_response(response);
+		} break;
+		case REQUEST_CHATGPT_CANCEL: {
+			_set_status(_u8("已取消 ChatGPT 登录"));
+		} break;
+		case REQUEST_CHATGPT_LOGOUT: {
+			chatgpt_account_id.clear();
+			chatgpt_account_label.clear();
+			chatgpt_account_email.clear();
+			chatgpt_plan_enabled = true;
+			_update_chatgpt_ui();
+			_set_status(_u8("已退出 ChatGPT 登录"));
+			_push_configuration(false);
 		} break;
 		case REQUEST_HISTORY: {
 			transcript->clear();
@@ -705,6 +932,166 @@ void AgentWorkspace::_quick_prompt(const String &p_text) {
 
 void AgentWorkspace::_show_settings() {
 	settings_dialog->popup_centered_clamped(Size2(480, 620) * EDSCALE, 0.85);
+	// 打开设置时刷新 sidecar 报告的认证能力/账号状态。
+	_refresh_config_state();
+}
+
+void AgentWorkspace::_on_auth_mode_selected(int p_index) {
+	_update_chatgpt_ui();
+	if (p_index == 1 && !_chatgpt_mode_active()) {
+		_set_status(_u8("请先登录 ChatGPT 账号，再保存设置"));
+	}
+}
+
+void AgentWorkspace::_start_chatgpt_login() {
+	if (!backend_ready) {
+		_set_status(_u8("Agent 后台尚未就绪，无法登录 ChatGPT"), true);
+		return;
+	}
+	if (!chatgpt_supported || chatgpt_codex_version.is_empty()) {
+		_set_status(_u8("当前 Codex 版本不支持 ChatGPT 登录"), true);
+		return;
+	}
+	if (chatgpt_login_active) {
+		return;
+	}
+	if (request_kind != REQUEST_NONE) {
+		_set_status(_u8("正在等待上一个请求完成，请稍后重试"), true);
+		return;
+	}
+	chatgpt_login_active = true;
+	chatgpt_login_id.clear();
+	chatgpt_poll_elapsed = 0.0;
+	chatgpt_login_elapsed = 0.0;
+	_update_chatgpt_ui();
+	_set_status(_u8("正在启动 ChatGPT 登录…"));
+	// 只发送空 JSON；OAuth/PKCE/授权 URL 全部由 sidecar 处理。
+	_request("/v1/auth/chatgpt/start", HTTPClient::METHOD_POST, Dictionary(), REQUEST_CHATGPT_START);
+	if (request_kind != REQUEST_CHATGPT_START) {
+		_finish_chatgpt_login();
+		_set_status(_u8("无法开始 ChatGPT 登录，请稍后重试或改用 API Key"), true);
+	}
+}
+
+void AgentWorkspace::_cancel_chatgpt_login() {
+	if (!chatgpt_login_active || chatgpt_login_id.is_empty()) {
+		return;
+	}
+	String login_id = chatgpt_login_id;
+	// 先本地停止轮询并清理 login_id，即使 cancel 请求无法发出也不遗留轮询。
+	_finish_chatgpt_login();
+	_set_status(_u8("已取消 ChatGPT 登录"));
+	if (request_kind == REQUEST_NONE) {
+		Dictionary body;
+		body["login_id"] = login_id;
+		_request("/v1/auth/chatgpt/cancel", HTTPClient::METHOD_POST, body, REQUEST_CHATGPT_CANCEL);
+	}
+}
+
+void AgentWorkspace::_logout_chatgpt() {
+	if (chatgpt_account_id.is_empty()) {
+		return;
+	}
+	if (request_kind != REQUEST_NONE) {
+		_set_status(_u8("正在等待上一个请求完成，请稍后重试"), true);
+		return;
+	}
+	Dictionary body;
+	body["account_id"] = chatgpt_account_id;
+	_request("/v1/auth/chatgpt/logout", HTTPClient::METHOD_POST, body, REQUEST_CHATGPT_LOGOUT);
+	if (request_kind != REQUEST_CHATGPT_LOGOUT) {
+		_set_status(_u8("退出 ChatGPT 登录失败，请稍后重试"), true);
+	}
+}
+
+void AgentWorkspace::_finish_chatgpt_login() {
+	chatgpt_login_active = false;
+	chatgpt_login_id.clear();
+	chatgpt_poll_elapsed = 0.0;
+	chatgpt_login_elapsed = 0.0;
+	_update_chatgpt_ui();
+}
+
+void AgentWorkspace::_process_chatgpt_poll(double p_delta) {
+	if (!chatgpt_login_active || chatgpt_login_id.is_empty()) {
+		return;
+	}
+	chatgpt_login_elapsed += p_delta;
+	if (chatgpt_login_elapsed > 300.0) {
+		_finish_chatgpt_login();
+		_set_status(_u8("ChatGPT 登录超时，请重试或改用 API Key"), true);
+		return;
+	}
+	if (request_kind != REQUEST_NONE) {
+		return;
+	}
+	chatgpt_poll_elapsed += p_delta;
+	if (chatgpt_poll_elapsed < 1.0) {
+		return;
+	}
+	chatgpt_poll_elapsed = 0.0;
+	_request("/v1/auth/chatgpt/status?login_id=" + chatgpt_login_id.uri_encode(), HTTPClient::METHOD_GET, Dictionary(), REQUEST_CHATGPT_STATUS);
+}
+
+void AgentWorkspace::_handle_chatgpt_status_response(const Dictionary &p_response) {
+	if (!chatgpt_login_active) {
+		return;
+	}
+	String state = String(p_response.get("status", p_response.get("state", "pending"))).strip_edges().to_lower();
+	if (state == "completed" || state == "complete" || state == "success" || state == "succeeded") {
+		Dictionary account = _agent_auth_account(p_response);
+		if (!_apply_chatgpt_account(account)) {
+			_finish_chatgpt_login();
+			_set_status(_u8("ChatGPT 登录返回的账号信息无效，请重试或改用 API Key"), true);
+			return;
+		}
+		_finish_chatgpt_login();
+#if defined(MACOS_ENABLED)
+		if (auth_mode) {
+			auth_mode->select(1);
+		}
+#endif
+		_update_chatgpt_ui();
+		_set_status(chatgpt_plan_enabled ? _u8("ChatGPT 账号已登录") : _u8("ChatGPT 账号已登录，但当前账号不具备 Codex 计划能力"));
+		_push_configuration(false);
+		return;
+	}
+	if (state == "failed" || state == "error") {
+		_finish_chatgpt_login();
+		_set_status(_u8("ChatGPT 登录失败，请重试或改用 API Key"), true);
+		return;
+	}
+	if (state == "cancelled" || state == "canceled" || state == "expired") {
+		_finish_chatgpt_login();
+		_set_status(_u8("ChatGPT 登录已取消或过期，请重新登录"));
+		return;
+	}
+	// pending 或未知状态：继续等待，但绝不回显 sidecar 原始错误。
+	chatgpt_poll_elapsed = 0.0;
+	_update_chatgpt_ui();
+}
+
+void AgentWorkspace::_handle_chatgpt_request_error(RequestKind p_kind, int p_code) {
+	switch (p_kind) {
+		case REQUEST_CHATGPT_START:
+			_finish_chatgpt_login();
+			_set_status(vformat(_u8("无法开始 ChatGPT 登录（HTTP %d），请重试或改用 API Key"), p_code), true);
+			break;
+		case REQUEST_CHATGPT_STATUS:
+			if (chatgpt_login_active) {
+				_finish_chatgpt_login();
+				_set_status(vformat(_u8("ChatGPT 登录状态查询失败（HTTP %d），请重新登录"), p_code), true);
+			}
+			break;
+		case REQUEST_CHATGPT_CANCEL:
+			_set_status(_u8("已取消 ChatGPT 登录"));
+			break;
+		case REQUEST_CHATGPT_LOGOUT:
+			_set_status(vformat(_u8("退出 ChatGPT 登录失败（HTTP %d），请稍后重试"), p_code), true);
+			break;
+		default:
+			break;
+	}
 }
 
 void AgentWorkspace::_rollback_last_task() {
@@ -1101,6 +1488,10 @@ void AgentWorkspace::_stop_sidecar() {
 		http->cancel_request();
 		request_kind = REQUEST_NONE;
 	}
+	// 后台停止时终止 ChatGPT 轮询并清理短期 login_id；账号 metadata 允许保留展示。
+	_finish_chatgpt_login();
+	config_state_loaded = false;
+	config_state_retry = 0.0;
 	if (backend_ready && sidecar_pid != 0 && OS::get_singleton()->is_process_running(sidecar_pid)) {
 		Ref<HTTPClient> shutdown_client = Ref<HTTPClient>(HTTPClient::create());
 		int port = backend_url.get_slice(":", 2).to_int();
@@ -1166,6 +1557,14 @@ void AgentWorkspace::_notification(int p_what) {
 			}
 		}
 		_process_stream(delta);
+		_process_chatgpt_poll(delta);
+		if (backend_ready && !config_state_loaded) {
+			config_state_retry -= delta;
+			if (config_state_retry <= 0.0) {
+				config_state_retry = 3.0;
+				_refresh_config_state();
+			}
+		}
 		if (test_evidence && test_evidence->is_visible_in_tree()) {
 			test_evidence->set_vertical(test_evidence->get_size().x < 600 * EDSCALE);
 		}
@@ -1381,6 +1780,22 @@ AgentWorkspace::AgentWorkspace() {
 	};
 	add_field("API Key", &api_key);
 	api_key->set_secret(true);
+#if defined(MACOS_ENABLED)
+	// ChatGPT 认证入口只在 macOS 构建中出现：Codex app-server 的 ChatGPT 登录能力仅随
+	// macOS sidecar 提供，Windows/Linux 继续只使用 API Key。即便在 macOS，也要等
+	// sidecar /v1/configure 返回 chatgpt_supported=true 且 codex_version 非空才启用。
+	Label *auth_mode_label = memnew(Label(_u8("认证模式")));
+	settings_grid->add_child(auth_mode_label);
+	auth_mode = memnew(OptionButton);
+	auth_mode->set_h_size_flags(SIZE_EXPAND_FILL);
+	auth_mode->add_item("API Key");
+	auth_mode->set_item_metadata(0, "api_key");
+	auth_mode->add_item("ChatGPT");
+	auth_mode->set_item_metadata(1, "chatgpt");
+	auth_mode->set_item_disabled(1, true);
+	settings_grid->add_child(auth_mode);
+	auth_mode->connect(SceneStringName(item_selected), callable_mp(this, &AgentWorkspace::_on_auth_mode_selected));
+#endif
 	add_field(_u8("接口地址"), &base_url);
 	add_field(_u8("主模型"), &model);
 	add_field(_u8("视觉模型"), &vision_model);
@@ -1399,6 +1814,33 @@ AgentWorkspace::AgentWorkspace() {
 	String saved_language = EDITOR_DEF("vibe_agent/response_language", "zh-CN");
 	response_language->select(saved_language == "en" ? 1 : saved_language == "auto" ? 2 : 0);
 	settings_grid->add_child(response_language);
+#if defined(MACOS_ENABLED)
+	// 状态区只展示账号 label/email/plan_enabled 等 metadata，不展示任何 token 或授权 URL。
+	chatgpt_section = memnew(VBoxContainer);
+	chatgpt_section->set_h_size_flags(SIZE_EXPAND_FILL);
+	settings_content->add_child(chatgpt_section);
+	chatgpt_status = memnew(Label(_u8("未登录")));
+	chatgpt_status->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	chatgpt_section->add_child(chatgpt_status);
+	chatgpt_account_info = memnew(Label());
+	chatgpt_account_info->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	chatgpt_section->add_child(chatgpt_account_info);
+	HBoxContainer *chatgpt_actions = memnew(HBoxContainer);
+	chatgpt_section->add_child(chatgpt_actions);
+	chatgpt_login_button = memnew(Button(_u8("登录 ChatGPT")));
+	chatgpt_login_button->set_disabled(true);
+	chatgpt_actions->add_child(chatgpt_login_button);
+	chatgpt_login_button->connect(SceneStringName(pressed), callable_mp(this, &AgentWorkspace::_start_chatgpt_login));
+	chatgpt_cancel_button = memnew(Button(_u8("取消登录")));
+	chatgpt_cancel_button->set_disabled(true);
+	chatgpt_actions->add_child(chatgpt_cancel_button);
+	chatgpt_cancel_button->connect(SceneStringName(pressed), callable_mp(this, &AgentWorkspace::_cancel_chatgpt_login));
+	chatgpt_logout_button = memnew(Button(_u8("退出登录")));
+	chatgpt_logout_button->set_disabled(true);
+	chatgpt_actions->add_child(chatgpt_logout_button);
+	chatgpt_logout_button->connect(SceneStringName(pressed), callable_mp(this, &AgentWorkspace::_logout_chatgpt));
+	chatgpt_section->hide();
+#endif
 	Button *save_settings = memnew(Button(_u8("保存设置")));
 	settings_content->add_child(save_settings);
 	save_settings->connect(SceneStringName(pressed), callable_mp(this, &AgentWorkspace::_save_settings));

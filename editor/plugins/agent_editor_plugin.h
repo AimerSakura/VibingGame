@@ -38,6 +38,11 @@ class AgentWorkspace : public VBoxContainer {
 		REQUEST_HARNESS_PLAN,
 		REQUEST_HARNESS_SAVE,
 		REQUEST_ROLLBACK,
+		REQUEST_CONFIG_STATE,
+		REQUEST_CHATGPT_START,
+		REQUEST_CHATGPT_STATUS,
+		REQUEST_CHATGPT_CANCEL,
+		REQUEST_CHATGPT_LOGOUT,
 	};
 
 	enum StreamKind {
@@ -66,6 +71,13 @@ class AgentWorkspace : public VBoxContainer {
 	LineEdit *model = nullptr;
 	LineEdit *vision_model = nullptr;
 	OptionButton *response_language = nullptr;
+	OptionButton *auth_mode = nullptr;
+	VBoxContainer *chatgpt_section = nullptr;
+	Label *chatgpt_status = nullptr;
+	Label *chatgpt_account_info = nullptr;
+	Button *chatgpt_login_button = nullptr;
+	Button *chatgpt_cancel_button = nullptr;
+	Button *chatgpt_logout_button = nullptr;
 	AcceptDialog *settings_dialog = nullptr;
 	Button *send_button = nullptr;
 	Button *cancel_button = nullptr;
@@ -91,6 +103,19 @@ class AgentWorkspace : public VBoxContainer {
 	String current_run_id;
 	String last_agent_run_id;
 	String last_prompt;
+	// ChatGPT 认证由 sidecar 托管：编辑器只保存短期 login_id/account_id 与展示用 metadata。
+	String chatgpt_login_id;
+	String chatgpt_account_id;
+	String chatgpt_account_label;
+	String chatgpt_account_email;
+	String chatgpt_codex_version;
+	bool chatgpt_plan_enabled = true;
+	bool chatgpt_supported = false;
+	bool chatgpt_login_active = false;
+	bool config_state_loaded = false;
+	double chatgpt_poll_elapsed = 0.0;
+	double chatgpt_login_elapsed = 0.0;
+	double config_state_retry = 0.0;
 	PackedStringArray attachment_ids;
 	RequestKind request_kind = REQUEST_NONE;
 	bool backend_ready = false;
@@ -129,6 +154,21 @@ class AgentWorkspace : public VBoxContainer {
 	void _show_settings();
 	void _quick_prompt(const String &p_text);
 	void _rollback_last_task();
+
+	bool _is_chatgpt_request(RequestKind p_kind) const;
+	bool _chatgpt_mode_active() const;
+	void _apply_config_state(const Dictionary &p_response);
+	bool _apply_chatgpt_account(const Dictionary &p_account);
+	void _update_chatgpt_ui();
+	void _refresh_config_state();
+	void _start_chatgpt_login();
+	void _cancel_chatgpt_login();
+	void _logout_chatgpt();
+	void _process_chatgpt_poll(double p_delta);
+	void _handle_chatgpt_status_response(const Dictionary &p_response);
+	void _handle_chatgpt_request_error(RequestKind p_kind, int p_code);
+	void _finish_chatgpt_login();
+	void _on_auth_mode_selected(int p_index);
 
 	void _choose_attachments();
 	void _choose_assets();
