@@ -87,11 +87,11 @@ version_from_binary() {
 sha256_file() {
 	local file="$1"
 	if have_command shasum; then
-		shasum -a 256 "$file" | awk '{print $1}'
+		LC_ALL=C shasum -a 256 "$file" | awk '{print $1}'
 	elif have_command sha256sum; then
-		sha256sum "$file" | awk '{print $1}'
+		LC_ALL=C sha256sum "$file" | awk '{print $1}'
 	elif have_command openssl; then
-		openssl dgst -sha256 "$file" | sed 's/^.*= //'
+		LC_ALL=C openssl dgst -sha256 "$file" | sed 's/^.*= //'
 	else
 		die "shasum, sha256sum or openssl is required to verify the download"
 	fi
