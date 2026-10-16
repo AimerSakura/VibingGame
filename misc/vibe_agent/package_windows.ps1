@@ -39,6 +39,23 @@ if (-not (Test-Path -LiteralPath (Join-Path $sidecar "godotvibe-agent.exe"))) {
     throw "Agent sidecar not found. Run misc/vibe_agent/build_sidecar.ps1 first."
 }
 
+# Fetch, verify and stage the official Codex Windows x86_64 release before
+# touching the output directory. CODEX_VERSION, CODEX_RELEASE_ROOT and CODEX_BIN
+# pass through for development overrides; fetch_codex_windows.ps1 still enforces
+# the SHA-256 manifest, the x86_64 PE layout and the requested version. No token,
+# model or working directory is ever passed on the command line.
+$fetchCodex = Join-Path $PSScriptRoot "fetch_codex_windows.ps1"
+$codexLayout = & $fetchCodex
+if ($LASTEXITCODE -ne 0 -or -not $codexLayout) {
+    throw "Codex fetch failed."
+}
+$codexLayout = [IO.Path]::GetFullPath([string]$codexLayout)
+$codexVersion = & $fetchCodex -Validate -ReleaseRoot $codexLayout
+if ($LASTEXITCODE -ne 0 -or -not $codexVersion) {
+    throw "Codex release validation failed."
+}
+$codexVersion = [string]$codexVersion
+
 if (Test-Path -LiteralPath $output) {
     if (-not $output.StartsWith($buildRoot, [StringComparison]::OrdinalIgnoreCase)) {
         throw "For safety, OutputDir must be under $buildRoot"
@@ -47,14 +64,25 @@ if (Test-Path -LiteralPath $output) {
 }
 
 $sidecarTarget = Join-Path $output "vibe_agent/godotvibe-agent"
+$codexTarget = Join-Path $output "vibe_agent/codex"
 $licenses = Join-Path $output "licenses/python-packages"
-New-Item -ItemType Directory -Path $sidecarTarget, $licenses -Force | Out-Null
+New-Item -ItemType Directory -Path $sidecarTarget, $codexTarget, $licenses -Force | Out-Null
 Copy-Item -LiteralPath $engine -Destination (Join-Path $output "VibeGodot.exe")
 $console = $engine.Replace(".exe", ".console.exe")
 if (Test-Path -LiteralPath $console) {
     Copy-Item -LiteralPath $console -Destination (Join-Path $output "VibeGodot.console.exe")
 }
 Copy-Item -Path (Join-Path $sidecar "*") -Destination $sidecarTarget -Recurse -Force
+Get-ChildItem -LiteralPath $codexLayout -Force | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $codexTarget -Recurse -Force
+}
+
+# Re-verify the copied layout so a broken bundle fails packaging instead of the
+# sidecar at runtime.
+$copiedVersion = & $fetchCodex -Validate -ReleaseRoot $codexTarget -Version $codexVersion
+if ($LASTEXITCODE -ne 0 -or -not $copiedVersion) {
+    throw "Copied Codex release failed validation."
+}
 
 Copy-Item -LiteralPath (Join-Path $repoRoot "LICENSE.txt") -Destination (Join-Path $output "GODOT_LICENSE.txt")
 $pythonLicense = Join-Path (Split-Path $PythonExe) "LICENSE.txt"

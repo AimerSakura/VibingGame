@@ -51,7 +51,24 @@ Tests 分别展示行为断言、视觉判断和运行诊断。仅在进程正�
 
 OAuth 令牌、访问令牌、刷新令牌和 ID 令牌都不会写入项目文件、启动参数、环境变量、SSE 或日志，只保存在操作系统凭据存储中。界面、日志和文档不会展示任何真实令牌、授权码、Cookie 或授权地址。
 
-macOS arm64 是首个支持 **Sign in with ChatGPT** 的平台；Windows 版本仍仅支持 API Key 模式，现有 Windows PowerShell 脚本及其行为保持不变。
+Windows x86_64 与 macOS arm64 均支持 **Sign in with ChatGPT**；Windows 的 OAuth 令牌使用当前 Windows 用户的凭据管理器保存，不写入项目、启动参数、环境变量、SSE 或日志。API Key 模式仍可作为回退方式使用；Windows ARM64 暂不支持。完整发布包随附固定版本、经 SHA-256、目录结构、版本号与 PE/Mach-O 架构校验的 Codex app-server，必须分发完整发布包而不能只复制编辑器可执行文件。
+
+## Windows x86_64 打包说明
+
+Windows 版本在 **PowerShell** 中构建并打包（需先按仓库根目录 README 的说明安装 Visual Studio C++ 工具链与 64 位 Python 3.12）：
+
+```powershell
+python -m pip install --target .build/pythonlibs scons pyinstaller fastapi uvicorn openai "pydantic>=2,<3" pillow requests pygltflib python-multipart
+$env:PYTHONPATH="$PWD\.build\pythonlibs;$PWD"
+$pythonExe = (Get-Command python -CommandType Application).Source
+& $pythonExe -m SCons platform=windows target=editor arch=x86_64 production=yes debug_symbols=no d3d12=no -j4
+.\misc\vibe_agent\build_sidecar.ps1 -PythonExe $pythonExe
+.\misc\vibe_agent\package_windows.ps1 -PythonExe $pythonExe -SkipBuild -SkipSidecarBuild -Zip
+```
+
+`package_windows.ps1` 会先调用 `misc/vibe_agent/fetch_codex_windows.ps1`：下载固定版本 `0.146.0` 的 Windows x86_64 Codex 包（`codex-package-x86_64-pc-windows-msvc.tar.gz`，失败时回退官方 GitHub `openai/codex` 的 `rust-v0.146.0`），先取 `codex-package_SHA256SUMS` 并用其中的 SHA-256 校验，再使用 Windows 10 1803+ 自带的 `tar.exe` 解压，然后校验 `bin/codex.exe`、`codex-resources`、`codex-path`、`codex-package.json`、`codex.exe --version` 与 PE 头 machine `0x8664`。校验通过后把整个 release root 复制到发布包的 `vibe_agent/codex`，复制完成后再校验一次。下载缓存与临时文件位于 `.build/codex`。缺少 `tar.exe`、校验失败或架构不符都会直接终止打包，不会生成不完整发布包。可用环境变量 `CODEX_VERSION`、`CODEX_RELEASE_ROOT`、`CODEX_BIN` 覆盖版本或复用已有布局，但覆盖来源同样必须通过完整校验；这些覆盖不会携带任何令牌、模型或工作目录。Windows ARM64 暂不支持。
+
+随包的 `vibe_agent/codex` 是固定版本、经过校验的 Codex app-server 组件，用于 ChatGPT / Codex 登录；请保留发布包中的全部文件，不能只复制编辑器或 `codex` 目录中的 EXE。
 
 ## macOS arm64 使用说明
 

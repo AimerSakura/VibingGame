@@ -39,15 +39,15 @@ Agent 支持两种模型接入方式，可在顶部 **设置** 弹窗中切换�
 | 方式 | 适用平台 | 说明 |
 | --- | --- | --- |
 | API Key | Windows 与 macOS | 填写兼容模型服务的接口地址、主模型、视觉模型和 API Key |
-| ChatGPT / Codex | 首发支持 macOS arm64（Apple 芯片），Windows 暂不提供 | 不需要 OpenAI API Key，使用 ChatGPT 账号登录 |
+| ChatGPT / Codex | Windows x86_64 与 macOS arm64（Apple 芯片） | 不需要 OpenAI API Key，使用 ChatGPT 账号登录 |
 
 **API Key 模式**：在“设置”中填写接口地址、模型名称和 API Key 后保存。API Key 由操作系统凭据存储保管（Windows 凭据管理器；macOS 登录钥匙串），不写入项目、启动参数、环境变量、SSE 或日志。
 
 **ChatGPT / Codex 模式**：点击 **Sign in with ChatGPT**，在浏览器中完成授权；如果账号下包含多个可用账号，再按提示选择要使用的账号。登录后设置界面会显示账号元数据（如账号标识与名称）。需要时可以切换账号，或退出登录 / 撤销授权；退出或撤销后需重新登录才能继续使用该模式。该模式不需要 OpenAI API Key。
 
-无论使用哪种模式，OAuth、访问令牌、刷新令牌和 ID 令牌都不会写入项目文件、命令行参数、环境变量、SSE 事件或日志，仅保存在操作系统凭据存储中（macOS 登录钥匙串；Windows 凭据管理器用于 API Key）。界面、日志和文档不会展示任何真实令牌、授权码、Cookie 或授权地址。
+无论使用哪种模式，OAuth、访问令牌、刷新令牌和 ID 令牌都不会写入项目文件、命令行参数、环境变量、SSE 事件或日志，仅保存在操作系统凭据存储中（Windows 凭据管理器、macOS 登录钥匙串）。界面、日志和文档不会展示任何真实令牌、授权码、Cookie 或授权地址。
 
-macOS arm64 是首个支持 **Sign in with ChatGPT** 的平台；Windows 版本仍仅支持 API Key 模式，现有 Windows PowerShell 构建与打包脚本及其行为保持不变。
+Windows x86_64 与 macOS arm64 均支持 **Sign in with ChatGPT**。Windows 的 OAuth 令牌使用当前 Windows 用户的凭据管理器保存；API Key 模式仍可作为回退方式使用。Windows ARM64 暂不支持。完整发布包随附固定版本、经 SHA-256、目录结构、版本号和 PE/Mach-O 架构校验的 Codex app-server（Windows 位于 `vibe_agent/codex`，macOS 位于 `VibeGodot.app/Contents/Resources/vibe_agent/codex`），使用者必须分发完整发布包，不能只复制编辑器可执行文件。
 
 ## 自动测试与回修
 
@@ -132,6 +132,8 @@ if ($LASTEXITCODE -ne 0) { throw "Sidecar build failed" }
 
 `-SkipBuild` 和 `-SkipSidecarBuild` 只适用于前两步已经成功的情况。不要在编辑器或后台仍使用旧构建文件时覆盖打包目录；脚本会替换指定的输出目录，因此不要把游戏项目放入其中。
 
+`package_windows.ps1` 会先调用 `misc/vibe_agent/fetch_codex_windows.ps1`：从 `releases.openai.com` 下载固定版本 `0.146.0` 的 Windows x86_64 Codex 包（`codex-package-x86_64-pc-windows-msvc.tar.gz`，失败时回退官方 GitHub `openai/codex` 的 `rust-v0.146.0`），先取 `codex-package_SHA256SUMS` 并用其中的 SHA-256 校验，再用 Windows 10 1803+ 自带的 `tar.exe` 解压，然后校验 `bin/codex.exe`、`codex-resources`、`codex-path`、`codex-package.json`、`codex.exe --version` 以及 PE 头 machine `0x8664`。校验通过后把整个 release root 复制到发布包的 `vibe_agent/codex`，复制完成后再校验一次。下载缓存与临时文件位于 `.build/codex`；缺少 `tar.exe`、校验失败或架构不符都会直接终止打包，不会生成不完整发布包。可用环境变量 `CODEX_VERSION`、`CODEX_RELEASE_ROOT`、`CODEX_BIN` 覆盖版本或复用已有布局，但覆盖来源同样必须通过全部校验；这些覆盖不会携带任何令牌、模型或工作目录。Windows ARM64 暂不支持。
+
 默认输出：
 
 ```text
@@ -141,19 +143,25 @@ if ($LASTEXITCODE -ne 0) { throw "Sidecar build failed" }
     ├── VibeGodot.exe
     ├── VibeGodot.console.exe
     ├── vibe_agent/
-    │   └── godotvibe-agent/
-    │       ├── godotvibe-agent.exe
-    │       └── _internal/
+    │   ├── godotvibe-agent/
+    │   │   ├── godotvibe-agent.exe
+    │   │   └── _internal/
+    │   └── codex/
+    │       ├── bin/codex.exe
+    │       ├── codex-resources/
+    │       ├── codex-path/
+    │       └── codex-package.json
     ├── licenses/
     └── 使用说明.md
 ```
 
-解压完整 ZIP 后运行 `VibeGodot.exe`。分发时保留全部文件，不能只复制编辑器或 sidecar 的 EXE；目标电脑无需安装 Python。构建产物不会随源码提交，游戏导出需要与定制编辑器版本匹配的导出模板。
+解压完整 ZIP 后运行 `VibeGodot.exe`。分发时保留全部文件，不能只复制编辑器、sidecar 或 `codex` 目录中的 EXE；目标电脑无需安装 Python。构建产物不会随源码提交，游戏导出需要与定制编辑器版本匹配的导出模板。
 
 ### 常见构建问题
 
 - **找不到 SCons / PyInstaller**：确认依赖安装成功，并在当前 PowerShell 中设置了上述 `PYTHONPATH`。
 - **找不到 MSVC / Windows SDK**：检查 Visual Studio 的 C++ 工作负载和 SDK，使用 Developer PowerShell 重试。
+- **找不到 `tar.exe`**：确认在 Windows 10 1803 或更高版本上运行；`tar.exe` 随系统提供，不需要额外安装，也不要改用 Git 或其他来源的 `tar`。
 - **PowerShell 阻止脚本运行**：检查脚本来源后，按本机或组织的执行策略允许运行；不要修改系统安全策略来绕过组织限制。
 - **后台缺失或启动失败**：确认运行的是完整发布目录，检查游戏项目中的 `.godot/agent/sidecar.log`。
 

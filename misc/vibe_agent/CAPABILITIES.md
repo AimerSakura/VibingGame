@@ -21,15 +21,16 @@
 | Godot API 文档 | Godot 原生 Search Help |
 | Agent 设置 | 顶部按钮打开设置弹窗，包含模型、回答语言、清空对话和回退；对话与 Tests 使用完整宽度 |
 | 分发 | 定制编辑器与 PyInstaller onedir sidecar；Windows x86_64 发布包与 macOS arm64 `.app`；目标机无需 Python |
-| 账号登录方式 | API Key 模式（Windows 与 macOS）；ChatGPT / Codex 模式（macOS arm64 首发，无需 OpenAI API Key） |
+| 账号登录方式 | API Key 模式（Windows 与 macOS）；ChatGPT / Codex 模式（Windows x86_64 与 macOS arm64） |
 | ChatGPT 登录与账号管理 | 点击 **Sign in with ChatGPT**，在浏览器完成授权后按需选择账号；显示账号元数据，支持切换账号与退出登录 / 撤销授权 |
-| 凭据与令牌保护 | OAuth、访问、刷新和 ID 令牌只存操作系统凭据存储（Windows 凭据管理器、macOS 登录钥匙串），不写入项目、启动参数、环境变量、SSE 或日志；macOS 包内随附经校验且版本固定的 Codex app-server |
+| 凭据与令牌保护 | OAuth、访问、刷新和 ID 令牌只存操作系统凭据存储（Windows 凭据管理器、macOS 登录钥匙串），不写入项目、启动参数、环境变量、SSE 或日志；Windows 与 macOS 完整包内均随附经 SHA-256、目录结构、版本号与 PE/Mach-O 架构校验的固定版本 Codex app-server |
 
 CLI、Agent、Harness、提示词和 API 知识库继续保留。旧网页仅在阶段验收期间保留为对照，确认能力齐全后再删除。
 
 ## 平台限制
 
-- 仅支持 macOS arm64（Apple 芯片），不提供 Intel 或 universal 版本。
-- ChatGPT / Codex 登录首发仅支持 macOS arm64；Windows 仍为 API Key 模式，现有 Windows PowerShell 脚本与行为保持不变。
+- 支持 Windows x86_64 与 macOS arm64（Apple 芯片）；不提供 macOS Intel、macOS universal 或 Windows ARM64 版本。
+- ChatGPT / Codex 登录在 Windows x86_64 与 macOS arm64 均可用；Windows 的 OAuth 令牌保存在凭据管理器，API Key 模式仍可作为回退方式。
 - macOS `.app` 当前未签名、未公证；从网络下载后可能被 Gatekeeper 与 quarantine 拦截，需要用户确认来源后手动允许打开，是否绕过或允许打开由用户自行决定。
+- Windows 发布包为未签名 ZIP，仅支持 x86_64；使用 Windows 10 1803+ 自带的 `tar.exe` 解压随包 Codex 发布件，缺少时打包脚本直接报错。
 - 仅使用 PyInstaller onedir sidecar，不生成嵌套 `.app`；API Key 与 ChatGPT / Codex 登录令牌只保存在操作系统凭据存储（macOS 登录钥匙串、Windows 凭据管理器），不落明文。
