@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import time
 import unittest
+import urllib.error
 import urllib.parse
 import urllib.request
 from unittest.mock import patch
@@ -74,6 +76,28 @@ def _ec_jwks(public_key, *, kid: str = "test-kid") -> dict:
             }
         ]
     }
+
+
+class _TrackingBytesIO(io.BytesIO):
+    """记录 read() 传入的 size，用于验证响应体是有界读取。"""
+
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.read_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        return super().read(size)
+
+
+def _http_error(code: int, body: bytes = b"") -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        ca.TOKEN_ENDPOINT,
+        code,
+        "error",
+        {"Content-Type": "application/json"},
+        io.BytesIO(body),
+    )
 
 
 def make_account(**overrides) -> ca.CodexAccount:
@@ -281,6 +305,67 @@ class ExchangeCodeTest(unittest.TestCase):
                 ca.exchange_code(client_id="c", code="CODE", verifier="VER", redirect_uri="r")
         self.assertEqual(str(ctx.exception), "invalid_grant")
 
+    def test_http_error_preserves_official_oauth_code(self):
+        body = json.dumps({
+            "error": "invalid_grant",
+            "error_description": "DO-NOT-LEAK-DESCRIPTION",
+        }).encode("utf-8")
+        with patch.object(urllib.request, "urlopen", side_effect=_http_error(400, body)):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.exchange_code(client_id="c", code="CODE", verifier="VER", redirect_uri="r")
+        self.assertEqual(str(ctx.exception), "invalid_grant")
+        self.assertNotIn("DO-NOT-LEAK-DESCRIPTION", str(ctx.exception))
+
+    def test_http_error_unsafe_code_falls_back_to_generic(self):
+        body = json.dumps({"error": "Invalid Grant"}).encode("utf-8")
+        with patch.object(urllib.request, "urlopen", side_effect=_http_error(400, body)):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.exchange_code(client_id="c", code="CODE", verifier="VER", redirect_uri="r")
+        self.assertEqual(str(ctx.exception), "token_request_failed")
+
+    def test_http_error_code_with_trailing_newline_falls_back_to_generic(self):
+        body = json.dumps({"error": "invalid_grant\n"}).encode("utf-8")
+        with patch.object(urllib.request, "urlopen", side_effect=_http_error(400, body)):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.exchange_code(client_id="c", code="CODE", verifier="VER", redirect_uri="r")
+        self.assertEqual(str(ctx.exception), "token_request_failed")
+
+    def test_http_error_invalid_json_falls_back_to_generic(self):
+        with patch.object(
+            urllib.request, "urlopen", side_effect=_http_error(400, b"<html>oops</html>")
+        ):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.exchange_code(client_id="c", code="CODE", verifier="VER", redirect_uri="r")
+        self.assertEqual(str(ctx.exception), "token_request_failed")
+
+    def test_http_error_missing_code_falls_back_to_generic(self):
+        body = json.dumps({"error_description": "DO-NOT-LEAK-DESCRIPTION"}).encode("utf-8")
+        with patch.object(urllib.request, "urlopen", side_effect=_http_error(400, body)):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.exchange_code(client_id="c", code="CODE", verifier="VER", redirect_uri="r")
+        self.assertEqual(str(ctx.exception), "token_request_failed")
+        self.assertNotIn("DO-NOT-LEAK-DESCRIPTION", str(ctx.exception))
+
+    def test_network_error_falls_back_to_generic(self):
+        with patch.object(
+            urllib.request, "urlopen", side_effect=urllib.error.URLError("boom")
+        ):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.exchange_code(client_id="c", code="CODE", verifier="VER", redirect_uri="r")
+        self.assertEqual(str(ctx.exception), "token_request_failed")
+
+    def test_http_error_body_read_is_bounded(self):
+        body = _TrackingBytesIO(json.dumps({"error": "invalid_grant"}).encode("utf-8"))
+        error = urllib.error.HTTPError(
+            ca.TOKEN_ENDPOINT, 400, "error", {"Content-Type": "application/json"}, body
+        )
+        with patch.object(urllib.request, "urlopen", side_effect=error):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.exchange_code(client_id="c", code="CODE", verifier="VER", redirect_uri="r")
+        self.assertEqual(str(ctx.exception), "invalid_grant")
+        self.assertTrue(body.read_sizes)
+        self.assertTrue(all(size >= 0 for size in body.read_sizes))
+
 
 class IdTokenTest(unittest.TestCase):
     @classmethod
@@ -431,6 +516,34 @@ class RefreshTest(unittest.TestCase):
         with patch.object(ca, "_post_form", side_effect=ca._HttpError(503)):
             with self.assertRaises(ca.CodexAuthError):
                 ca.refresh(account)
+
+    def test_refresh_http_error_preserves_official_oauth_code(self):
+        account = make_account()
+        body = json.dumps({
+            "error": "invalid_grant",
+            "error_description": "DO-NOT-LEAK-DESCRIPTION",
+        }).encode("utf-8")
+        with patch.object(urllib.request, "urlopen", side_effect=_http_error(400, body)):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.refresh(account)
+        self.assertEqual(str(ctx.exception), "invalid_grant")
+        self.assertNotIn("DO-NOT-LEAK-DESCRIPTION", str(ctx.exception))
+        self.assertNotIn(account.refresh_token, str(ctx.exception))
+
+    def test_refresh_http_error_without_code_is_generic(self):
+        account = make_account()
+        with patch.object(urllib.request, "urlopen", side_effect=_http_error(400, b"not-json")):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.refresh(account)
+        self.assertEqual(str(ctx.exception), "refresh_request_failed")
+
+    def test_refresh_http_error_unsafe_code_falls_back_to_generic(self):
+        account = make_account()
+        body = json.dumps({"error": "invalid_grant\nLEAK"}).encode("utf-8")
+        with patch.object(urllib.request, "urlopen", side_effect=_http_error(400, body)):
+            with self.assertRaises(ca.CodexAuthError) as ctx:
+                ca.refresh(account)
+        self.assertEqual(str(ctx.exception), "refresh_request_failed")
 
     def test_refresh_does_not_log_secrets(self):
         account = make_account(access_token="AT-SECRET", refresh_token="RT-SECRET", id_token="ID-SECRET")

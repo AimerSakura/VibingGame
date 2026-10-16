@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import queue
+import re
 import secrets
 import threading
 import time
@@ -51,6 +52,9 @@ REVOKE_ATTEMPTS = 3
 REVOKE_BACKOFF_S = 0.5
 
 _ALLOWED_ALGS = ("RS256", "ES256")
+# HTTP 错误响应只做有界读取；只接受官方风格的 OAuth error code。
+_MAX_HTTP_ERROR_BODY_BYTES = 65536
+_SAFE_OAUTH_ERROR_CODE_RE = re.compile(r"[a-z0-9_-]{1,128}")
 _CALLBACK_KEYS = frozenset(
     {"code", "state", "error", "error_description", "scope", "client_id"})
 _CALLBACK_HTML = (
@@ -72,12 +76,19 @@ class CodexAuthError(RuntimeError):
 
 
 class _HttpError(Exception):
-    """内部 HTTP 失败信号；只携带状态码。"""
+    """内部 HTTP 失败信号；只携带状态码与可选的官方 OAuth 错误码。"""
 
-    def __init__(self, status: int, message: str = "") -> None:
+    def __init__(
+        self,
+        status: int,
+        message: str = "",
+        *,
+        oauth_error: str | None = None,
+    ) -> None:
         super().__init__("http_%s" % status)
         self.status = status
         self.message = message
+        self.oauth_error = oauth_error
 
 
 @dataclass(frozen=True)
@@ -129,6 +140,36 @@ def _b64url_uint(data: str) -> int:
     return int.from_bytes(_b64url_decode(data), "big")
 
 
+def _safe_oauth_error_code(payload: Any) -> str | None:
+    """只接受小写字母/数字/下划线/连字符组成的 OAuth 错误码。"""
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("error")
+    if not isinstance(code, str):
+        return None
+    if not _SAFE_OAUTH_ERROR_CODE_RE.fullmatch(code):
+        return None
+    return code
+
+
+def _http_error_oauth_code(exc: urllib.error.HTTPError) -> str | None:
+    """有界读取并解析 HTTPError 正文，仅返回安全的 OAuth 错误码。
+
+    正文（可能含 error_description）在函数返回后即被丢弃，不写日志、不进异常。
+    """
+    try:
+        raw = exc.read(_MAX_HTTP_ERROR_BODY_BYTES)
+    except Exception:
+        return None
+    if not isinstance(raw, (bytes, bytearray)):
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return None
+    return _safe_oauth_error_code(payload)
+
+
 def _post_form(url: str, data: dict[str, str]) -> dict[str, Any]:
     body = urllib.parse.urlencode(data).encode("ascii")
     request = urllib.request.Request(
@@ -144,7 +185,10 @@ def _post_form(url: str, data: dict[str, str]) -> dict[str, Any]:
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
             raw = response.read()
     except urllib.error.HTTPError as exc:
-        raise _HttpError(int(exc.code)) from None
+        raise _HttpError(
+            int(exc.code),
+            oauth_error=_http_error_oauth_code(exc),
+        ) from None
     except urllib.error.URLError:
         raise _HttpError(0, "network_error") from None
     if not raw:
@@ -183,6 +227,11 @@ def _oauth_error(response: dict[str, Any]) -> CodexAuthError | None:
         # 官方错误码不含令牌；原样上报以便按错误矩阵恢复。
         return CodexAuthError(str(code))
     return None
+
+
+def _oauth_http_error(exc: _HttpError, generic: str) -> CodexAuthError:
+    """HTTP 失败时优先透传可安全识别的官方错误码，否则回退通用错误码。"""
+    return CodexAuthError(exc.oauth_error or generic)
 
 
 # --------------------------------------------------------------------------- #
@@ -377,8 +426,8 @@ def exchange_code(
     }
     try:
         response = _post_form(TOKEN_ENDPOINT, data)
-    except _HttpError:
-        raise CodexAuthError("token_request_failed") from None
+    except _HttpError as exc:
+        raise _oauth_http_error(exc, "token_request_failed") from None
     error = _oauth_error(response)
     if error is not None:
         raise error
@@ -534,8 +583,8 @@ def refresh(account: CodexAccount) -> CodexAccount:
         }
         try:
             response = _post_form(TOKEN_ENDPOINT, data)
-        except _HttpError:
-            raise CodexAuthError("refresh_request_failed") from None
+        except _HttpError as exc:
+            raise _oauth_http_error(exc, "refresh_request_failed") from None
         error = _oauth_error(response)
         if error is not None:
             raise error
