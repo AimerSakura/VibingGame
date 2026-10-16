@@ -50,11 +50,18 @@ ERR_TOOLS_UNSUPPORTED = "codex_tools_unsupported"
 
 #: A thread id is only ever a bounded, single-line identifier.
 _SAFE_THREAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,199}$")
+#: A turn id is likewise a bounded, single-line identifier.
+_SAFE_TURN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@+-]{0,255}$")
 _THREAD_FILENAME = "thread.json"
 _THREAD_DIR_PARTS = (".godot", "agent", "codex")
 _MAX_THREAD_FILE_BYTES = 4096
 _INVOKE_PREFIX = "vibe-codex-invoke-"
 _CANCEL_POLL_S = 0.05
+#: Only an exact ``completed`` status is a successful terminal turn.
+_KNOWN_TURN_STATUSES = frozenset({"completed", "failed", "interrupted"})
+#: How long the cancel watcher waits for the app-server to expose a turn id
+#: before it force-stops the stalled server.
+_CANCEL_TURN_ID_TIMEOUT_S = 1.0
 
 
 class CodexProviderError(RuntimeError):
@@ -63,6 +70,12 @@ class CodexProviderError(RuntimeError):
 
 def _safe_thread_id(value: Any) -> str:
     if isinstance(value, str) and _SAFE_THREAD_ID_RE.fullmatch(value):
+        return value
+    return ""
+
+
+def _safe_turn_id(value: Any) -> str:
+    if isinstance(value, str) and _SAFE_TURN_ID_RE.fullmatch(value):
         return value
     return ""
 
@@ -285,17 +298,40 @@ class CodexProvider:
     # ------------------------------------------------------------------
     def _watch_cancel(self, server: Any, thread_id: str, cancel_event: threading.Event,
                       finished: threading.Event) -> None:
+        # Wait (without busy-spinning) for the caller to request cancellation.
         while not finished.is_set():
-            if not cancel_event.wait(_CANCEL_POLL_S):
-                continue
+            if cancel_event.wait(_CANCEL_POLL_S):
+                break
+        if finished.is_set() or not cancel_event.is_set():
+            return
+        # The turn id may not be observable yet: the turn/start response or the
+        # turn/started notification can still be in flight when cancellation
+        # arrives.  Keep polling for a real turn id instead of interrupting
+        # with ``None`` and giving up.
+        deadline = time.monotonic() + _CANCEL_TURN_ID_TIMEOUT_S
+        while not finished.is_set():
+            try:
+                turn_id = _safe_turn_id(server.current_turn_id(thread_id))
+            except Exception:
+                turn_id = ""
+            if turn_id:
+                try:
+                    server.interrupt(thread_id, turn_id)
+                    return
+                except Exception:
+                    pass
             if finished.is_set():
                 return
-            try:
-                turn_id = server.current_turn_id(thread_id)
-                server.interrupt(thread_id, turn_id)
-            except Exception:
-                pass
-            return
+            if time.monotonic() >= deadline:
+                break
+            finished.wait(_CANCEL_POLL_S)
+        # No turn id ever appeared.  Force the stalled server to stop so
+        # ``run_turn`` can end and ``run_agent`` reports ERR_INTERRUPTED rather
+        # than waiting forever.
+        try:
+            server.stop()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # public: one agent turn
@@ -360,13 +396,23 @@ class CodexProvider:
                         })
                     elif kind == "turn_completed":
                         status = getattr(event, "status", None)
-                        if status in (None, "completed"):
+                        # Only an exact "completed" status is success; None,
+                        # "failed", "interrupted" and unknown statuses fall
+                        # through to the ERR_TURN_FAILED check below.
+                        if status == "completed":
                             completed = True
-                        emit("turn_completed", {"status": status or "completed"})
+                        emit("turn_completed", {
+                            "status": status if isinstance(status, str) and status in _KNOWN_TURN_STATUSES else "unknown",
+                        })
                     elif kind == "error":
                         # Never forward the raw message: it may embed prompts or tokens.
                         emit("error", {"message": ERR_TURN_FAILED, "status": getattr(event, "status", None)})
             except Exception:
+                # A cancellation may have force-stopped the server, which can
+                # surface as a stream exception: that is still an interruption,
+                # not a generic turn failure.
+                if interrupted or (cancel_event is not None and cancel_event.is_set()):
+                    raise CodexProviderError(ERR_INTERRUPTED) from None
                 raise CodexProviderError(ERR_TURN_FAILED) from None
             if interrupted or (cancel_event is not None and cancel_event.is_set()):
                 raise CodexProviderError(ERR_INTERRUPTED)
@@ -426,7 +472,7 @@ class CodexProvider:
                     kind = getattr(event, "kind", "")
                     if kind == "agent_delta":
                         reply.append(getattr(event, "text", "") or "")
-                    elif kind == "turn_completed" and getattr(event, "status", None) in (None, "completed"):
+                    elif kind == "turn_completed" and getattr(event, "status", None) == "completed":
                         completed = True
             except Exception:
                 raise CodexProviderError(ERR_TURN_FAILED) from None

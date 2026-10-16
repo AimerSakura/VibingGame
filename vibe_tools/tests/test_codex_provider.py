@@ -75,11 +75,15 @@ class FakeAppServer:
         self.resume_calls: list[str] = []
         self.turns: list[tuple[str, str]] = []
         self.interrupt_calls: list[tuple[str, str | None]] = []
+        self.effective_interrupt_calls = 0
+        self.current_turn_id_results: list[str | None] = []
+        self.current_turn_id_calls = 0
         self.new_thread_id = "thread-fake-0001"
         self.turn_id = "turn-fake-0001"
         self.start_raises = False
         self.thread_raises = False
         self.resume_raises = False
+        self.raise_on_stop = False
         self.events: list = []
 
     def start(self) -> None:
@@ -106,8 +110,13 @@ class FakeAppServer:
         self.turns.append((thread_id, text))
         for event in self.events:
             if event == "WAIT_FOR_INTERRUPT":
-                while not self.interrupt_calls:
+                # A turn is only released by an interrupt that carries a real
+                # turn id (or by the server being stopped); interrupt(None)
+                # does not actually stop a turn.
+                while not self.effective_interrupt_calls:
                     if not self._sleep():
+                        if self.raise_on_stop:
+                            raise CodexAppServerError("raw stopped stream failure " + FAKE_TOKEN)
                         break
                 yield TurnEvent("turn_completed", status="interrupted")
             else:
@@ -118,10 +127,16 @@ class FakeAppServer:
         return not self.stopped
 
     def current_turn_id(self, thread_id: str):
+        self.current_turn_id_calls += 1
+        if self.current_turn_id_results:
+            index = min(self.current_turn_id_calls - 1, len(self.current_turn_id_results) - 1)
+            return self.current_turn_id_results[index]
         return self.turn_id
 
     def interrupt(self, thread_id: str, turn_id: str | None = None) -> None:
         self.interrupt_calls.append((thread_id, turn_id))
+        if turn_id:
+            self.effective_interrupt_calls += 1
 
 
 class FakeServerFactory:
@@ -133,17 +148,21 @@ class FakeServerFactory:
         events=None,
         new_thread_id: str = "thread-fake-0001",
         turn_id: str = "turn-fake-0001",
+        turn_id_sequence=None,
         start_raises: bool = False,
         thread_raises: bool = False,
         resume_raises: bool = False,
+        raise_on_stop: bool = False,
     ) -> None:
         self.instances: list[FakeAppServer] = []
         self.events = events
         self.new_thread_id = new_thread_id
         self.turn_id = turn_id
+        self.turn_id_sequence = turn_id_sequence
         self.start_raises = start_raises
         self.thread_raises = thread_raises
         self.resume_raises = resume_raises
+        self.raise_on_stop = raise_on_stop
 
     def __call__(self, codex_exe: str, cwd: str, access_token: str, model: str) -> FakeAppServer:
         server = FakeAppServer(codex_exe, cwd, access_token, model)
@@ -151,9 +170,12 @@ class FakeServerFactory:
             server.events = list(self.events)
         server.new_thread_id = self.new_thread_id
         server.turn_id = self.turn_id
+        if self.turn_id_sequence is not None:
+            server.current_turn_id_results = list(self.turn_id_sequence)
         server.start_raises = self.start_raises
         server.thread_raises = self.thread_raises
         server.resume_raises = self.resume_raises
+        server.raise_on_stop = self.raise_on_stop
         self.instances.append(server)
         return server
 
@@ -433,6 +455,34 @@ class CodexProviderTest(unittest.TestCase):
         self.assertEqual(str(ctx.exception), ERR_TURN_FAILED)
         self.assertTrue(factory.instances[0].stopped)
 
+    def test_turn_completed_requires_exact_completed_status(self):
+        # Only an exact "completed" status is a successful turn.  None,
+        # "failed", "interrupted" and unknown/absent statuses must all fail
+        # closed with the fixed safe error code.
+        account = make_account()
+        for status in (None, "failed", "interrupted", "unexpected-status"):
+            with self.subTest(status=status):
+                factory = FakeServerFactory(
+                    events=[
+                        TurnEvent("agent_delta", text="partial reply"),
+                        TurnEvent("turn_completed", status=status),
+                    ]
+                )
+                provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+                events: list[tuple[str, dict]] = []
+                with self.assertRaises(CodexProviderError) as ctx:
+                    provider.run_agent(
+                        "go", str(self.stage), self.project, threading.Event(),
+                        lambda n, p: events.append((n, p)),
+                    )
+                self.assertEqual(str(ctx.exception), ERR_TURN_FAILED)
+                self.assertNotIn(FAKE_TOKEN, str(ctx.exception))
+                terminal = [payload for name, payload in events if name == "turn_completed"]
+                self.assertEqual(len(terminal), 1)
+                self.assertNotEqual(terminal[0]["status"], "completed")
+                self.assertNotIn(FAKE_TOKEN, json.dumps(events))
+                self.assertTrue(factory.instances[0].stopped)
+
     def test_cancel_interrupts_with_current_turn_id_and_stops(self):
         account = make_account()
         factory = FakeServerFactory(events=["WAIT_FOR_INTERRUPT"], new_thread_id="thread-cancel", turn_id="turn-42")
@@ -459,6 +509,125 @@ class CodexProviderTest(unittest.TestCase):
         self.assertIsInstance(captured.get("error"), CodexProviderError)
         self.assertEqual(str(captured["error"]), ERR_INTERRUPTED)
         self.assertEqual(server.interrupt_calls, [("thread-cancel", "turn-42")])
+        self.assertTrue(server.stopped)
+
+    def test_cancel_waits_for_late_turn_id_before_interrupting(self):
+        # The turn id may not be observable at the instant cancellation is
+        # requested (the turn/start response may still be in flight).  The
+        # watcher must keep polling and interrupt the real turn rather than
+        # giving up after a single None lookup.
+        account = make_account()
+        factory = FakeServerFactory(
+            events=["WAIT_FOR_INTERRUPT"],
+            new_thread_id="thread-late",
+            turn_id="turn-late-9",
+            turn_id_sequence=[None, "turn-late-9"],
+        )
+        provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+        cancel_event = threading.Event()
+        captured: dict = {}
+
+        def run():
+            try:
+                provider.run_agent("go", str(self.stage), self.project, cancel_event, lambda n, p: None)
+            except CodexProviderError as error:
+                captured["error"] = error
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        server = factory.instances[0]
+        for _ in range(500):
+            if server.turns:
+                break
+            threading.Event().wait(0.01)
+        cancel_event.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), "run_agent did not finish after cancellation")
+        self.assertIsInstance(captured.get("error"), CodexProviderError)
+        self.assertEqual(str(captured["error"]), ERR_INTERRUPTED)
+        self.assertGreaterEqual(server.current_turn_id_calls, 2)
+        self.assertEqual(server.interrupt_calls, [("thread-late", "turn-late-9")])
+        self.assertTrue(server.stopped)
+
+    def test_cancel_without_turn_id_stops_and_returns_interrupted(self):
+        # If the app-server never exposes a turn id, cancellation must still
+        # terminate the turn in bounded time (by stopping the server) and
+        # surface the interrupted error instead of hanging or reporting a
+        # generic turn failure.
+        account = make_account()
+        factory = FakeServerFactory(
+            events=["WAIT_FOR_INTERRUPT"],
+            new_thread_id="thread-never",
+            turn_id_sequence=[None],
+        )
+        provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+        cancel_event = threading.Event()
+        captured: dict = {}
+
+        def run():
+            try:
+                provider.run_agent("go", str(self.stage), self.project, cancel_event, lambda n, p: None)
+            except CodexProviderError as error:
+                captured["error"] = error
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        server = factory.instances[0]
+        for _ in range(500):
+            if server.turns:
+                break
+            threading.Event().wait(0.01)
+        cancel_event.set()
+        worker.join(5)
+        alive = worker.is_alive()
+        if alive:
+            # Release a provider that failed to bound the wait so the test
+            # process can exit; the assertion below still reports the failure.
+            server.stop()
+            worker.join(2)
+        self.assertFalse(alive, "run_agent hung without a turn id")
+        self.assertIsInstance(captured.get("error"), CodexProviderError)
+        self.assertEqual(str(captured["error"]), ERR_INTERRUPTED)
+        self.assertEqual(server.interrupt_calls, [])
+        self.assertTrue(server.stopped)
+
+    def test_cancel_forced_stop_stream_error_is_reported_as_interrupted(self):
+        # When no turn id is available the watcher force-stops the server; the
+        # resulting stream error must still surface as ERR_INTERRUPTED (a
+        # sanitized code), never as a generic turn failure or a raw message.
+        account = make_account()
+        factory = FakeServerFactory(
+            events=["WAIT_FOR_INTERRUPT"],
+            new_thread_id="thread-raise",
+            turn_id_sequence=[None],
+            raise_on_stop=True,
+        )
+        provider = self.build_provider(accounts={account.account_id: account}, server_factory=factory)
+        cancel_event = threading.Event()
+        captured: dict = {}
+
+        def run():
+            try:
+                provider.run_agent("go", str(self.stage), self.project, cancel_event, lambda n, p: None)
+            except CodexProviderError as error:
+                captured["error"] = error
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        server = factory.instances[0]
+        for _ in range(500):
+            if server.turns:
+                break
+            threading.Event().wait(0.01)
+        cancel_event.set()
+        worker.join(5)
+        if worker.is_alive():
+            server.stop()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertIsInstance(captured.get("error"), CodexProviderError)
+        self.assertEqual(str(captured["error"]), ERR_INTERRUPTED)
+        self.assertNotIn(FAKE_TOKEN, str(captured["error"]))
         self.assertTrue(server.stopped)
 
     # -- disposable invoke ------------------------------------------------- #
