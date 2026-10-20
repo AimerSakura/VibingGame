@@ -424,6 +424,26 @@ void AgentWorkspace::_request_models() {
 	_request("/v1/models", HTTPClient::METHOD_GET, Dictionary(), REQUEST_MODELS);
 }
 
+void AgentWorkspace::_request_pending_models() {
+	if (!models_refresh_pending || !backend_ready || request_kind != REQUEST_NONE) {
+		return;
+	}
+	models_refresh_pending = false;
+	// 配置保存后强制按 sidecar 已确认的当前模式重拉一次；标志位用于和 UI 自动请求去重。
+	if (_chatgpt_mode_active()) {
+		if (models_requested) {
+			return;
+		}
+		models_requested = true;
+	} else {
+		if (api_models_requested) {
+			return;
+		}
+		api_models_requested = true;
+	}
+	_request_models();
+}
+
 void AgentWorkspace::_update_codex_image_capability() {
 	// ChatGPT 模式只有模型声明 image input modality 时才允许添加参考图片；
 	// 未确认/未知一律按不支持处理，避免把图片发到不支持视觉的模型。
@@ -592,7 +612,7 @@ bool AgentWorkspace::_apply_chatgpt_account(const Dictionary &p_account) {
 	return true;
 }
 
-void AgentWorkspace::_apply_config_state(const Dictionary &p_response) {
+void AgentWorkspace::_apply_config_state(const Dictionary &p_response, bool p_request_models) {
 	String credential_store = String(p_response.get("credential_store", "windows"));
 	String saved_label = credential_store == "macos"
 			? _u8("已保存到 macOS 钥匙串")
@@ -624,13 +644,13 @@ void AgentWorkspace::_apply_config_state(const Dictionary &p_response) {
 		}
 	}
 #endif
-	_update_chatgpt_ui();
+	_update_chatgpt_ui(p_request_models);
 }
 
-void AgentWorkspace::_update_chatgpt_ui() {
+void AgentWorkspace::_update_chatgpt_ui(bool p_request_models) {
 	if (!auth_mode) {
 		// Linux 及其他平台只有 API Key 模式：仍需加载 API 模型列表或保留手动输入。
-		if (backend_ready && request_kind == REQUEST_NONE && !api_models_requested) {
+		if (p_request_models && backend_ready && request_kind == REQUEST_NONE && !api_models_requested) {
 			api_models_requested = true;
 			_request_models();
 		}
@@ -685,7 +705,7 @@ void AgentWorkspace::_update_chatgpt_ui() {
 	}
 	_update_codex_image_capability();
 	// 按当前模式拉取各自的模型列表：ChatGPT 只在已登录后拉取，API Key 模式始终允许手动回退。
-	if (backend_ready && request_kind == REQUEST_NONE) {
+	if (p_request_models && backend_ready && request_kind == REQUEST_NONE) {
 		if (chatgpt_selected && logged_in && !models_requested) {
 			models_requested = true;
 			_request_models();
@@ -744,7 +764,12 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 		} break;
 		case REQUEST_CONFIGURE: {
 			api_key->clear();
-			_apply_config_state(response);
+			// 保存成功后 sidecar 已切换到本次提交的 auth_mode；先同步 UI，
+			// 再强制排队一次当前模式的模型刷新，避免沿用旧模式或旧目录。
+			models_requested = false;
+			api_models_requested = false;
+			_apply_config_state(response, false);
+			models_refresh_pending = true;
 			_request("/v1/chat/history", HTTPClient::METHOD_GET, Dictionary(), REQUEST_HISTORY);
 		} break;
 		case REQUEST_CONFIG_STATE: {
@@ -794,7 +819,9 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 				auth_mode->select(0);
 			}
 #endif
-			_update_chatgpt_ui();
+			// 退出后 sidecar 会在随后的 /v1/configure 中回退 API Key；
+			// 模型列表等配置成功后再按实际模式重拉，不能用未保存的 UI 状态提前请求。
+			_update_chatgpt_ui(false);
 			_set_status(_u8("已退出 ChatGPT 登录"));
 			_push_configuration(false);
 		} break;
@@ -1203,10 +1230,10 @@ void AgentWorkspace::_show_settings() {
 }
 
 void AgentWorkspace::_on_auth_mode_selected(int p_index) {
-	// 切换模式后按新模式的持久化值重新拉取模型列表；两侧值互不覆盖。
-	models_requested = false;
-	api_models_requested = false;
-	_update_chatgpt_ui();
+	// 未保存的模式切换只更新显示；此时 sidecar 仍是旧 auth_mode，
+	// 不能提前请求 /v1/models。等 /v1/configure 成功后按实际模式重新拉取。
+	models_refresh_pending = false;
+	_update_chatgpt_ui(false);
 	if (p_index == 1 && !_chatgpt_mode_active()) {
 		_set_status(_u8("请先登录 ChatGPT 账号，再保存设置"));
 	}
@@ -1331,10 +1358,11 @@ void AgentWorkspace::_handle_chatgpt_status_response(const Dictionary &p_respons
 			auth_mode->select(1);
 		}
 #endif
-		// 登录完成后必须按新账号重新拉取 Codex 模型列表。
+		// 登录完成后必须按新账号重新拉取 Codex 模型列表；
+		// 但 sidecar 仍要在随后的 /v1/configure 成功后才切到 chatgpt，届时再拉取。
 		models_requested = false;
 		api_models_requested = false;
-		_update_chatgpt_ui();
+		_update_chatgpt_ui(false);
 		_set_status(chatgpt_plan_enabled ? _u8("ChatGPT 账号已登录") : _u8("ChatGPT 账号已登录，但当前账号不具备 Codex 计划能力"));
 		_push_configuration(false);
 		return;
@@ -1789,6 +1817,7 @@ void AgentWorkspace::_stop_sidecar() {
 	config_state_retry = 0.0;
 	models_requested = false;
 	api_models_requested = false;
+	models_refresh_pending = false;
 	if (backend_ready && sidecar_pid != 0 && OS::get_singleton()->is_process_running(sidecar_pid)) {
 		Ref<HTTPClient> shutdown_client = Ref<HTTPClient>(HTTPClient::create());
 		int port = backend_url.get_slice(":", 2).to_int();
@@ -1857,6 +1886,8 @@ void AgentWorkspace::_notification(int p_what) {
 		_process_chatgpt_poll(delta);
 		// status 轮询结束后在空闲帧补发排队的 cancel，保证取消请求最终只发送一次。
 		_flush_pending_chatgpt_cancel();
+		// 配置保存成功后补拉模型：等共享 HTTPRequest 空闲再发送，避免和 history 等请求冲突。
+		_request_pending_models();
 		if (backend_ready && !config_state_loaded) {
 			config_state_retry -= delta;
 			if (config_state_retry <= 0.0) {
