@@ -87,6 +87,7 @@ class AgentWorkspace : public VBoxContainer {
 	bool api_models_requested = false;
 	// /v1/configure 成功后按 sidecar 已确认的模式补拉模型；忙时排队，空闲帧只发送一次。
 	bool models_refresh_pending = false;
+	int models_retry_count = 0;
 	Button *attach_button = nullptr;
 	Label *chatgpt_status = nullptr;
 	Label *chatgpt_account_info = nullptr;
@@ -180,6 +181,7 @@ class AgentWorkspace : public VBoxContainer {
 	bool _auth_mode_selected() const;
 	String _codex_model_id() const;
 	void _request_models();
+	void _mark_model_request_failed();
 	void _apply_model_catalog(const Dictionary &p_response);
 	void _on_api_model_choice_selected(int p_index);
 	void _on_codex_model_selected(int p_index);

@@ -59,6 +59,20 @@ class AgentEditorStartupContractTest(unittest.TestCase):
         self.assertIn("_store_auth_mode_preference();", login)
         self.assertIn("_store_auth_mode_preference();", logout)
 
+    def test_model_failure_releases_request_and_schedules_one_retry(self):
+        failure_start = SOURCE.index('if (completed == REQUEST_MODELS)')
+        failure_end = SOURCE.index('String detail = response.has("detail"', failure_start)
+        failure = SOURCE[failure_start:failure_end]
+        settings_start = SOURCE.index("void AgentWorkspace::_show_settings()")
+        settings_end = SOURCE.index("void AgentWorkspace::_on_auth_mode_selected", settings_start)
+        settings = SOURCE[settings_start:settings_end]
+
+        self.assertIn("_mark_model_request_failed();", failure)
+        self.assertIn("void AgentWorkspace::_mark_model_request_failed()", SOURCE)
+        self.assertIn("models_requested = false;", SOURCE)
+        self.assertIn("models_refresh_pending = true;", SOURCE)
+        self.assertIn("models_retry_count = 0;", settings)
+
 
 if __name__ == "__main__":
     unittest.main()
