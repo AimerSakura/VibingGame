@@ -777,10 +777,8 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 		case REQUEST_CONFIG_STATE: {
 			const bool initial_config_state = !config_state_loaded;
 			_apply_config_state(response, false);
-			EditorSettings *settings = EditorSettings::get_singleton();
-			const bool has_saved_auth_mode = settings && settings->has_setting("vibe_agent/auth_mode");
 			const bool has_api_key = _agent_auth_flag(response.get("has_api_key", Variant()), false);
-			if (initial_config_state && auth_mode && !has_saved_auth_mode && chatgpt_supported &&
+			if (initial_config_state && auth_mode && !auth_mode_preference_loaded && chatgpt_supported &&
 					!chatgpt_codex_version.is_empty() && !chatgpt_account_id.is_empty() && !has_api_key) {
 				// 旧版本没有保存 auth_mode：已有 ChatGPT 账号且没有 API Key 时，
 				// 将首次升级迁移到 ChatGPT，避免登录状态被默认 API Key 遮蔽。
@@ -1269,6 +1267,7 @@ void AgentWorkspace::_store_auth_mode_preference() {
 		return;
 	}
 	settings->set_setting("vibe_agent/auth_mode", auth_mode->get_selected() == 1 ? "chatgpt" : "api_key");
+	auth_mode_preference_loaded = true;
 #endif
 }
 
@@ -2152,6 +2151,8 @@ AgentWorkspace::AgentWorkspace() {
 	auth_mode->set_item_disabled(1, true);
 	// auth_mode 属于编辑器偏好，不由 sidecar 的进程内默认值决定；否则重启后
 	// sidecar 还没返回账号状态时，UI 会先回到 API Key 并覆盖 ChatGPT 配置。
+	EditorSettings *settings = EditorSettings::get_singleton();
+	auth_mode_preference_loaded = settings && settings->has_setting("vibe_agent/auth_mode");
 	String saved_auth_mode = EDITOR_DEF("vibe_agent/auth_mode", "api_key");
 	auth_mode->select(saved_auth_mode == "chatgpt" ? 1 : 0);
 	settings_grid->add_child(auth_mode);

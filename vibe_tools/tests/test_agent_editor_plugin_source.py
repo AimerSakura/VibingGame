@@ -32,9 +32,23 @@ class AgentEditorStartupContractTest(unittest.TestCase):
     def test_migrates_existing_chatgpt_account_when_no_mode_preference_exists(self):
         config_state = switch_case_block("REQUEST_CONFIG_STATE", "REQUEST_MODELS")
 
-        self.assertIn('has_setting("vibe_agent/auth_mode")', config_state)
+        self.assertIn("!auth_mode_preference_loaded", config_state)
         self.assertIn("chatgpt_account_id.is_empty()", config_state)
         self.assertIn('auth_mode->select(1);', config_state)
+
+    def test_checks_auth_mode_preference_before_registering_default(self):
+        constructor_start = SOURCE.index("AgentWorkspace::AgentWorkspace()")
+        constructor = SOURCE[constructor_start:]
+
+        self.assertIn('bool auth_mode_preference_loaded = false;',
+                      Path(__file__).resolve().parents[2]
+                      .joinpath("editor", "plugins", "agent_editor_plugin.h")
+                      .read_text(encoding="utf-8"))
+        self.assertRegex(
+            constructor,
+            r'auth_mode_preference_loaded = settings && settings->has_setting\("vibe_agent/auth_mode"\);'
+            r'\s*String saved_auth_mode = EDITOR_DEF\("vibe_agent/auth_mode",',
+        )
 
     def test_login_and_logout_persist_the_selected_auth_mode(self):
         method_start = SOURCE.index("void AgentWorkspace::_handle_chatgpt_status_response")

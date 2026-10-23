@@ -131,6 +131,7 @@ class AgentWorkspace : public VBoxContainer {
 	bool chatgpt_plan_enabled = true;
 	bool chatgpt_supported = false;
 	bool chatgpt_login_active = false;
+	bool auth_mode_preference_loaded = false;
 	bool config_state_loaded = false;
 	double chatgpt_poll_elapsed = 0.0;
 	double chatgpt_login_elapsed = 0.0;
