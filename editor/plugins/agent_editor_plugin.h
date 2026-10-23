@@ -197,6 +197,7 @@ class AgentWorkspace : public VBoxContainer {
 	void _handle_chatgpt_request_error(RequestKind p_kind, int p_code);
 	void _finish_chatgpt_login();
 	void _on_auth_mode_selected(int p_index);
+	void _store_auth_mode_preference();
 
 	void _choose_attachments();
 	void _choose_assets();

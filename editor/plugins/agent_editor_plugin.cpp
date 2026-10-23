@@ -635,7 +635,7 @@ void AgentWorkspace::_apply_config_state(const Dictionary &p_response, bool p_re
 		api_models_requested = false;
 	}
 #if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
-	if (auth_mode) {
+	if (auth_mode && config_state_loaded) {
 		String mode = String(p_response.get("auth_mode", "")).strip_edges().to_lower();
 		if (mode == "chatgpt") {
 			auth_mode->select(1);
@@ -760,7 +760,9 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 			backend_ready = true;
 			last_agent_run_id = response.get("last_revertible_run_id", "");
 			_set_status(_u8("Agent 已连接"));
-			_push_configuration(false);
+			// 先读取 sidecar 的能力和账号 metadata，再同步本地配置；此时不能用
+			// 尚未恢复的默认 API Key 模式覆盖已经登录的 ChatGPT 模式。
+			_refresh_config_state();
 		} break;
 		case REQUEST_CONFIGURE: {
 			api_key->clear();
@@ -773,8 +775,24 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 			_request("/v1/chat/history", HTTPClient::METHOD_GET, Dictionary(), REQUEST_HISTORY);
 		} break;
 		case REQUEST_CONFIG_STATE: {
+			const bool initial_config_state = !config_state_loaded;
+			_apply_config_state(response, false);
+			EditorSettings *settings = EditorSettings::get_singleton();
+			const bool has_saved_auth_mode = settings && settings->has_setting("vibe_agent/auth_mode");
+			const bool has_api_key = _agent_auth_flag(response.get("has_api_key", Variant()), false);
+			if (initial_config_state && auth_mode && !has_saved_auth_mode && chatgpt_supported &&
+					!chatgpt_codex_version.is_empty() && !chatgpt_account_id.is_empty() && !has_api_key) {
+				// 旧版本没有保存 auth_mode：已有 ChatGPT 账号且没有 API Key 时，
+				// 将首次升级迁移到 ChatGPT，避免登录状态被默认 API Key 遮蔽。
+				auth_mode->select(1);
+				_store_auth_mode_preference();
+			}
 			config_state_loaded = true;
-			_apply_config_state(response);
+			if (initial_config_state) {
+				// 账号和 capability 已经同步，_push_configuration 才能正确提交
+				// 持久化的 auth_mode，并在 POST 成功后刷新对应模型列表。
+				_push_configuration(false);
+			}
 		} break;
 		case REQUEST_MODELS: {
 			_apply_model_catalog(response);
@@ -817,6 +835,7 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 			if (auth_mode) {
 				// 退出后 sidecar 回退 API Key，下拉必须显式同步，避免 UI 仍显示 ChatGPT 而已用 API Key。
 				auth_mode->select(0);
+				_store_auth_mode_preference();
 			}
 #endif
 			// 退出后 sidecar 会在随后的 /v1/configure 中回退 API Key；
@@ -1212,6 +1231,7 @@ void AgentWorkspace::_save_settings() {
 	}
 	settings->set_setting("vibe_agent/codex_model", codex_model_id);
 	settings->set_setting("vibe_agent/response_language", response_language->get_item_metadata(response_language->get_selected()));
+	_store_auth_mode_preference();
 	settings->save();
 	_push_configuration(true);
 }
@@ -1237,6 +1257,19 @@ void AgentWorkspace::_on_auth_mode_selected(int p_index) {
 	if (p_index == 1 && !_chatgpt_mode_active()) {
 		_set_status(_u8("请先登录 ChatGPT 账号，再保存设置"));
 	}
+}
+
+void AgentWorkspace::_store_auth_mode_preference() {
+#if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
+	if (!auth_mode) {
+		return;
+	}
+	EditorSettings *settings = EditorSettings::get_singleton();
+	if (!settings) {
+		return;
+	}
+	settings->set_setting("vibe_agent/auth_mode", auth_mode->get_selected() == 1 ? "chatgpt" : "api_key");
+#endif
 }
 
 void AgentWorkspace::_start_chatgpt_login() {
@@ -1356,6 +1389,7 @@ void AgentWorkspace::_handle_chatgpt_status_response(const Dictionary &p_respons
 #if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 		if (auth_mode) {
 			auth_mode->select(1);
+			_store_auth_mode_preference();
 		}
 #endif
 		// 登录完成后必须按新账号重新拉取 Codex 模型列表；
@@ -2116,6 +2150,10 @@ AgentWorkspace::AgentWorkspace() {
 	auth_mode->add_item("ChatGPT");
 	auth_mode->set_item_metadata(1, "chatgpt");
 	auth_mode->set_item_disabled(1, true);
+	// auth_mode 属于编辑器偏好，不由 sidecar 的进程内默认值决定；否则重启后
+	// sidecar 还没返回账号状态时，UI 会先回到 API Key 并覆盖 ChatGPT 配置。
+	String saved_auth_mode = EDITOR_DEF("vibe_agent/auth_mode", "api_key");
+	auth_mode->select(saved_auth_mode == "chatgpt" ? 1 : 0);
 	settings_grid->add_child(auth_mode);
 	auth_mode->connect(SceneStringName(item_selected), callable_mp(this, &AgentWorkspace::_on_auth_mode_selected));
 #endif
