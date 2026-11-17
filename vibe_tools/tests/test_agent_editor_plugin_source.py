@@ -73,6 +73,22 @@ class AgentEditorStartupContractTest(unittest.TestCase):
         self.assertIn("models_refresh_pending = true;", SOURCE)
         self.assertIn("models_retry_count = 0;", settings)
 
+    def test_model_retry_waits_and_clears_stale_error_status(self):
+        pending_start = SOURCE.index("void AgentWorkspace::_request_pending_models()")
+        pending_end = SOURCE.index("void AgentWorkspace::_update_codex_image_capability", pending_start)
+        pending = SOURCE[pending_start:pending_end]
+        failure_start = SOURCE.index("void AgentWorkspace::_mark_model_request_failed()")
+        failure_end = SOURCE.index("void AgentWorkspace::_request_pending_models()", failure_start)
+        failure = SOURCE[failure_start:failure_end]
+        settings_start = SOURCE.index("void AgentWorkspace::_show_settings()")
+        settings_end = SOURCE.index("void AgentWorkspace::_on_auth_mode_selected", settings_start)
+        settings = SOURCE[settings_start:settings_end]
+
+        self.assertIn("models_retry_delay > 0.0", pending)
+        self.assertIn("models_retry_count < 3", failure)
+        self.assertIn("models_retry_delay =", failure)
+        self.assertIn("codex_model_status->set_text(String());", settings)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -88,6 +88,7 @@ class AgentWorkspace : public VBoxContainer {
 	// /v1/configure 成功后按 sidecar 已确认的模式补拉模型；忙时排队，空闲帧只发送一次。
 	bool models_refresh_pending = false;
 	int models_retry_count = 0;
+	double models_retry_delay = 0.0;
 	Button *attach_button = nullptr;
 	Label *chatgpt_status = nullptr;
 	Label *chatgpt_account_info = nullptr;

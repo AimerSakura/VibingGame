@@ -434,15 +434,17 @@ void AgentWorkspace::_mark_model_request_failed() {
 #else
 	api_models_requested = false;
 #endif
-	// 网络或 Codex app-server 短暂失败时自动重试一次；失败后仍允许重新打开设置触发新一轮重试。
-	if (models_retry_count == 0) {
-		models_retry_count = 1;
+	// 启动阶段 Codex app-server 可能尚未稳定：最多自动重试三次，并逐步等待 1/2/3 秒；
+	// 失败后仍允许重新打开设置触发新一轮重试。
+	if (models_retry_count < 3) {
+		models_retry_count++;
+		models_retry_delay = models_retry_count;
 		models_refresh_pending = true;
 	}
 }
 
 void AgentWorkspace::_request_pending_models() {
-	if (!models_refresh_pending || !backend_ready || request_kind != REQUEST_NONE) {
+	if (!models_refresh_pending || !backend_ready || request_kind != REQUEST_NONE || models_retry_delay > 0.0) {
 		return;
 	}
 	models_refresh_pending = false;
@@ -457,6 +459,9 @@ void AgentWorkspace::_request_pending_models() {
 			return;
 		}
 		api_models_requested = true;
+	}
+	if (_auth_mode_selected() && codex_model_status) {
+		codex_model_status->set_text(_u8("正在获取 Codex 模型列表…"));
 	}
 	_request_models();
 }
@@ -553,9 +558,11 @@ void AgentWorkspace::_apply_model_catalog(const Dictionary &p_response) {
 				codex_model_status->set_text(_u8("无法获取 Codex 模型列表，请重新登录 ChatGPT 或检查网络。"));
 			} else if (models.is_empty()) {
 				models_retry_count = 0;
+				models_retry_delay = 0.0;
 				codex_model_status->set_text(_u8("没有可用的 Codex 模型，请检查账号的 Codex 计划能力。"));
 			} else {
 				models_retry_count = 0;
+				models_retry_delay = 0.0;
 				codex_model_status->set_text(String());
 			}
 		}
@@ -654,6 +661,7 @@ void AgentWorkspace::_apply_config_state(const Dictionary &p_response, bool p_re
 		models_requested = false;
 		api_models_requested = false;
 		models_retry_count = 0;
+		models_retry_delay = 0.0;
 	}
 #if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 	if (auth_mode && config_state_loaded) {
@@ -793,6 +801,7 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 			models_requested = false;
 			api_models_requested = false;
 			models_retry_count = 0;
+			models_retry_delay = 0.0;
 			_apply_config_state(response, false);
 			models_refresh_pending = true;
 			_request("/v1/chat/history", HTTPClient::METHOD_GET, Dictionary(), REQUEST_HISTORY);
@@ -860,6 +869,7 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 			}
 #endif
 			models_retry_count = 0;
+			models_retry_delay = 0.0;
 			// 退出后 sidecar 会在随后的 /v1/configure 中回退 API Key；
 			// 模型列表等配置成功后再按实际模式重拉，不能用未保存的 UI 状态提前请求。
 			_update_chatgpt_ui(false);
@@ -1269,7 +1279,11 @@ void AgentWorkspace::_show_settings() {
 	models_requested = false;
 	api_models_requested = false;
 	models_retry_count = 0;
+	models_retry_delay = 0.0;
 	models_refresh_pending = true;
+	if (codex_model_status) {
+		codex_model_status->set_text(String());
+	}
 	_refresh_config_state();
 }
 
@@ -1278,6 +1292,7 @@ void AgentWorkspace::_on_auth_mode_selected(int p_index) {
 	// 不能提前请求 /v1/models。等 /v1/configure 成功后按实际模式重新拉取。
 	models_refresh_pending = false;
 	models_retry_count = 0;
+	models_retry_delay = 0.0;
 	_update_chatgpt_ui(false);
 	if (p_index == 1 && !_chatgpt_mode_active()) {
 		_set_status(_u8("请先登录 ChatGPT 账号，再保存设置"));
@@ -1423,6 +1438,7 @@ void AgentWorkspace::_handle_chatgpt_status_response(const Dictionary &p_respons
 		models_requested = false;
 		api_models_requested = false;
 		models_retry_count = 0;
+		models_retry_delay = 0.0;
 		_update_chatgpt_ui(false);
 		_set_status(chatgpt_plan_enabled ? _u8("ChatGPT 账号已登录") : _u8("ChatGPT 账号已登录，但当前账号不具备 Codex 计划能力"));
 		_push_configuration(false);
@@ -1880,6 +1896,7 @@ void AgentWorkspace::_stop_sidecar() {
 	api_models_requested = false;
 	models_refresh_pending = false;
 	models_retry_count = 0;
+	models_retry_delay = 0.0;
 	if (backend_ready && sidecar_pid != 0 && OS::get_singleton()->is_process_running(sidecar_pid)) {
 		Ref<HTTPClient> shutdown_client = Ref<HTTPClient>(HTTPClient::create());
 		int port = backend_url.get_slice(":", 2).to_int();
@@ -1948,6 +1965,9 @@ void AgentWorkspace::_notification(int p_what) {
 		_process_chatgpt_poll(delta);
 		// status 轮询结束后在空闲帧补发排队的 cancel，保证取消请求最终只发送一次。
 		_flush_pending_chatgpt_cancel();
+		if (models_retry_delay > 0.0) {
+			models_retry_delay = MAX(0.0, models_retry_delay - delta);
+		}
 		// 配置保存成功后补拉模型：等共享 HTTPRequest 空闲再发送，避免和 history 等请求冲突。
 		_request_pending_models();
 		if (backend_ready && !config_state_loaded) {
