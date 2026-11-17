@@ -89,6 +89,24 @@ class AgentEditorStartupContractTest(unittest.TestCase):
         self.assertIn("models_retry_delay =", failure)
         self.assertIn("codex_model_status->set_text(String());", settings)
 
+    def test_model_http_failure_preserves_cached_models_and_clears_error(self):
+        failure_start = SOURCE.index("if (completed == REQUEST_MODELS)")
+        failure_end = SOURCE.index('String detail = response.has("detail"', failure_start)
+        failure = SOURCE[failure_start:failure_end]
+
+        # HTTP 请求失败时不会走到 _apply_model_catalog，上一次成功的 codex_model
+        # 缓存仍然可用：不能清空它，并且要清掉“无法获取”的误导性文案；
+        # 只有没有任何缓存模型时才显示现有失败提示。
+        self.assertNotIn("codex_model->clear();", failure)
+        self.assertIn("_mark_model_request_failed();", failure)
+        self.assertRegex(
+            failure,
+            r'if \(codex_model && codex_model->get_item_count\(\) > 0\) \{\s*'
+            r'codex_model_status->set_text\(String\(\)\);\s*'
+            r'\} else \{\s*'
+            r'codex_model_status->set_text\(_u8\("无法获取 Codex 模型列表',
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

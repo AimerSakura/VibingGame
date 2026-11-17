@@ -772,7 +772,13 @@ void AgentWorkspace::_request_completed(int p_result, int p_code, const PackedSt
 			// 模型列表失败时保留手动输入回退，不回显 sidecar 原始错误文本。
 			_mark_model_request_failed();
 			if (codex_model_status && _auth_mode_selected()) {
-				codex_model_status->set_text(_u8("无法获取 Codex 模型列表，请重新登录 ChatGPT 或检查网络。"));
+				// HTTP 失败不会覆盖 codex_model，上一次成功的缓存模型仍然可用；
+				// 此时清掉误导性的“无法获取”提示，仅在没有任何缓存时才报错。
+				if (codex_model && codex_model->get_item_count() > 0) {
+					codex_model_status->set_text(String());
+				} else {
+					codex_model_status->set_text(_u8("无法获取 Codex 模型列表，请重新登录 ChatGPT 或检查网络。"));
+				}
 			}
 			return;
 		}
