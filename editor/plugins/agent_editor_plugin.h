@@ -199,7 +199,7 @@ class AgentWorkspace : public VBoxContainer {
 	void _process_chatgpt_poll(double p_delta);
 	void _handle_chatgpt_status_response(const Dictionary &p_response);
 	void _handle_chatgpt_request_error(RequestKind p_kind, int p_code);
-	void _finish_chatgpt_login();
+	void _finish_chatgpt_login(bool p_request_models = true);
 	void _on_auth_mode_selected(int p_index);
 	void _store_auth_mode_preference();
 

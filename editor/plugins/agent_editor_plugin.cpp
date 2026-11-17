@@ -1401,12 +1401,12 @@ void AgentWorkspace::_logout_chatgpt() {
 	}
 }
 
-void AgentWorkspace::_finish_chatgpt_login() {
+void AgentWorkspace::_finish_chatgpt_login(bool p_request_models) {
 	chatgpt_login_active = false;
 	chatgpt_login_id.clear();
 	chatgpt_poll_elapsed = 0.0;
 	chatgpt_login_elapsed = 0.0;
-	_update_chatgpt_ui();
+	_update_chatgpt_ui(p_request_models);
 }
 
 void AgentWorkspace::_process_chatgpt_poll(double p_delta) {
@@ -1442,7 +1442,10 @@ void AgentWorkspace::_handle_chatgpt_status_response(const Dictionary &p_respons
 			_set_status(_u8("ChatGPT 登录返回的账号信息无效，请重试或改用 API Key"), true);
 			return;
 		}
-		_finish_chatgpt_login();
+		// 登录成功时 sidecar 尚未收到 auth_mode=chatgpt，此时不能请求模型，
+		// 否则会以 API Key 模式发出并占住共享请求通道，阻塞随后的 /v1/configure。
+		// 配置成功后再由 REQUEST_CONFIGURE 按 chatgpt 模式补拉目录。
+		_finish_chatgpt_login(false);
 #if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
 		if (auth_mode) {
 			auth_mode->select(1);

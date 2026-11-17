@@ -59,6 +59,40 @@ class AgentEditorStartupContractTest(unittest.TestCase):
         self.assertIn("_store_auth_mode_preference();", login)
         self.assertIn("_store_auth_mode_preference();", logout)
 
+    def test_completed_login_configures_chatgpt_before_requesting_models(self):
+        header = (
+            Path(__file__).resolve().parents[2]
+            / "editor"
+            / "plugins"
+            / "agent_editor_plugin.h"
+        ).read_text(encoding="utf-8")
+        self.assertIn("void _finish_chatgpt_login(bool p_request_models = true);", header)
+
+        status_start = SOURCE.index("void AgentWorkspace::_handle_chatgpt_status_response")
+        completed_start = SOURCE.index('if (state == "completed"', status_start)
+        completed_end = SOURCE.index('if (state == "failed"', completed_start)
+        completed = SOURCE[completed_start:completed_end]
+
+        # 登录成功时 sidecar 还没有收到 auth_mode=chatgpt：这里只能更新 UI，
+        # 不能提前请求模型，否则请求会以 API Key 模式发出并占住共享请求通道，
+        # 导致随后的 /v1/configure 无法提交，模型目录也就一直不会刷新。
+        # 必须先 _push_configuration(false)，等 REQUEST_CONFIGURE 成功后再补拉目录。
+        self.assertIn("_finish_chatgpt_login(false);", completed)
+        self.assertIn("_update_chatgpt_ui(false);", completed)
+        success_start = completed.index("_finish_chatgpt_login(false);")
+        success = completed[success_start:]
+        # 账号校验失败分支保持原有行为（可请求模型）；成功路径不得再用默认参数。
+        self.assertNotIn("_finish_chatgpt_login();", success)
+        self.assertLess(
+            success_start,
+            completed.index("_push_configuration(false);"),
+        )
+
+        finish_start = SOURCE.index("void AgentWorkspace::_finish_chatgpt_login(bool p_request_models)")
+        finish_end = SOURCE.index("void AgentWorkspace::_process_chatgpt_poll", finish_start)
+        finish = SOURCE[finish_start:finish_end]
+        self.assertIn("_update_chatgpt_ui(p_request_models);", finish)
+
     def test_model_failure_releases_request_and_schedules_one_retry(self):
         failure_start = SOURCE.index('if (completed == REQUEST_MODELS)')
         failure_end = SOURCE.index('String detail = response.has("detail"', failure_start)
