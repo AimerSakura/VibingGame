@@ -60,6 +60,11 @@ static String _agent_auth_identifier(const Variant &p_value) {
 }
 
 static String _agent_auth_text(const Variant &p_value, int p_max) {
+	if (p_value.get_type() == Variant::NIL) {
+		// JSON null 不能被 String(Variant) 转成 "<null>" 文本，否则成功目录的
+		// "error": null 会被误判为非空错误，导致 codex_model 永远不填充。
+		return String();
+	}
 	String out;
 	String text = String(p_value).strip_edges();
 	for (int index = 0; index < text.length() && out.length() < p_max; index++) {

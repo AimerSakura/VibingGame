@@ -154,6 +154,23 @@ class AgentEditorStartupContractTest(unittest.TestCase):
         self.assertIn("codex_model->get_item_count() > 0", error_branch)
         self.assertIn("codex_model_status->set_text(String());", error_branch)
 
+    def test_json_null_catalog_error_does_not_block_successful_catalog(self):
+        helper_start = SOURCE.index("static String _agent_auth_text")
+        helper_end = SOURCE.index("static String _agent_model_id_text", helper_start)
+        helper = SOURCE[helper_start:helper_end]
+        catalog_start = SOURCE.index("void AgentWorkspace::_apply_model_catalog")
+        catalog_end = SOURCE.index("void AgentWorkspace::_on_api_model_choice_selected", catalog_start)
+        catalog = SOURCE[catalog_start:catalog_end]
+
+        # 成功的 ChatGPT 目录响应会带 "error": null。Godot 把 NIL 转成字符串时
+        # 得到 "<null>"，若把它当成非空错误，目录会在填充 codex_model 之前返回，
+        # 下拉框保持为空并显示“无法获取”提示。NIL 必须解码为空字符串。
+        self.assertIn('_agent_auth_text(p_response.get("error", ""), 64)', catalog)
+        self.assertRegex(
+            helper,
+            r'(?s)if \(p_value\.get_type\(\) == Variant::NIL\) \{.*?return String\(\);.*?\}',
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
