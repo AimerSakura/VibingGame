@@ -107,6 +107,19 @@ class AgentEditorStartupContractTest(unittest.TestCase):
             r'codex_model_status->set_text\(_u8\("无法获取 Codex 模型列表',
         )
 
+    def test_model_catalog_error_preserves_cached_models_before_replacing_list(self):
+        method_start = SOURCE.index("void AgentWorkspace::_apply_model_catalog")
+        method_end = SOURCE.index("void AgentWorkspace::_on_api_model_choice_selected", method_start)
+        catalog = SOURCE[method_start:method_end]
+        clear_index = catalog.index("codex_model->clear();")
+        error_index = catalog.index("if (!error.is_empty())")
+        error_branch = catalog[error_index:clear_index]
+
+        self.assertLess(error_index, clear_index)
+        self.assertIn("_mark_model_request_failed();", error_branch)
+        self.assertIn("codex_model->get_item_count() > 0", error_branch)
+        self.assertIn("codex_model_status->set_text(String());", error_branch)
+
 
 if __name__ == "__main__":
     unittest.main()

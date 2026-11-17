@@ -497,6 +497,19 @@ void AgentWorkspace::_apply_model_catalog(const Dictionary &p_response) {
 	Array models = p_response.get("models", Array());
 	if (mode == "chatgpt") {
 #if defined(MACOS_ENABLED) || defined(WINDOWS_ENABLED)
+		if (!error.is_empty()) {
+			// 错误响应不代表上一次成功的目录失效：保留缓存模型，避免下拉框与错误提示矛盾。
+			_mark_model_request_failed();
+			if (codex_model && codex_model->get_item_count() > 0) {
+				if (codex_model_status) {
+					codex_model_status->set_text(String());
+				}
+			} else if (codex_model_status) {
+				codex_model_status->set_text(_u8("无法获取 Codex 模型列表，请重新登录 ChatGPT 或检查网络。"));
+			}
+			_update_codex_image_capability();
+			return;
+		}
 		if (codex_model) {
 			String previous = _codex_model_id();
 			if (previous.is_empty()) {
@@ -553,10 +566,7 @@ void AgentWorkspace::_apply_model_catalog(const Dictionary &p_response) {
 			codex_model->set_disabled(codex_model->get_item_count() == 0);
 		}
 		if (codex_model_status) {
-			if (!error.is_empty()) {
-				_mark_model_request_failed();
-				codex_model_status->set_text(_u8("无法获取 Codex 模型列表，请重新登录 ChatGPT 或检查网络。"));
-			} else if (models.is_empty()) {
+			if (models.is_empty()) {
 				models_retry_count = 0;
 				models_retry_delay = 0.0;
 				codex_model_status->set_text(_u8("没有可用的 Codex 模型，请检查账号的 Codex 计划能力。"));
